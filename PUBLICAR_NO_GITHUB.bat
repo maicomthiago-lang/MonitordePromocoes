@@ -26,7 +26,7 @@ git branch -M main
 
 echo [3/5] Conectando ao repositorio remoto...
 git remote remove origin >nul 2>&1
-git remote add origin https://github.com/maicomthiago-lang/monitordepromocoes.git
+git remote add origin https://github.com/maicomthiago-lang/MonitordePromocoes.git
 
 echo [4/5] Adicionando arquivos e criando commit...
 git add .
@@ -38,7 +38,7 @@ git push -u origin main --force
 if errorlevel 1 (
     echo.
     echo [AVISO] Caso seu repositorio no GitHub ainda se chame Monitor_de_Promocoes, tentando enviar para ele tambem...
-    git remote set-url origin https://github.com/maicomthiago-lang/Monitor_de_Promocoes.git
+    git remote set-url origin https://github.com/maicomthiago-lang/MonitordePromocoes.git
     git push -u origin main --force
 )
 
