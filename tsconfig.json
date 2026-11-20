@@ -8,7 +8,11 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "rootDir": ".",
     "outDir": "dist"
   },
-  "include": ["api/**/*"]
+  "include": ["api/**/*", "lib/**/*", "tests/**/*"]
 }

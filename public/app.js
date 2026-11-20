@@ -1,11 +1,71 @@
 (function () {
+  'use strict';
+
   var STORAGE_ITEMS_KEY = 'monitordepromocoes_items_v5';
   var STORAGE_ALERTS_KEY = 'monitordepromocoes_alerts_v5';
   var STORAGE_CFG_KEY = 'promo_cfg';
 
+  var serverOnline = false;
+  var serverStorageMode = 'none';
+  var isAutoScanning = false;
+
+  // --- Utilitários de Segurança (XSS, URL, CSV) ---
+  function escapeHtml(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function safeUrl(raw) {
+    if (typeof raw !== 'string') return '#';
+    var trimmed = raw.trim();
+    try {
+      var parsed = new URL(trimmed);
+      if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+        return parsed.toString();
+      }
+    } catch (e) {}
+    return '#';
+  }
+
+  function sanitizeCsvCell(value) {
+    var str = String(value == null ? '' : value);
+    if (/^[=+\-@\t\r]/.test(str)) {
+      str = "'" + str;
+    }
+    return '"' + str.replace(/"/g, '""') + '"';
+  }
+
+  function isValidEmail(email) {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(String(email || '').trim());
+  }
+
+  function generateId() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+      return window.crypto.randomUUID();
+    }
+    return 'id-' + Date.now() + '-' + Math.random().toString(36).substring(2, 10);
+  }
+
+  function buildDedupKey(itemId, offer) {
+    var cleanUrl = String(offer.url || '').split('?')[0].toLowerCase();
+    return [
+      itemId,
+      String(offer.store || '').toLowerCase(),
+      String(offer.currency || 'BRL'),
+      Number(offer.price || 0).toFixed(2),
+      cleanUrl
+    ].join('|');
+  }
+
+  // --- Persistência local + sincronização opcional com servidor ---
   function getItems() {
     try {
-      return JSON.parse(localStorage.getItem(STORAGE_ITEMS_KEY) || '[]');
+      var parsed = JSON.parse(localStorage.getItem(STORAGE_ITEMS_KEY) || '[]');
+      return Array.isArray(parsed) ? parsed : [];
     } catch (e) {
       return [];
     }
@@ -15,11 +75,19 @@
     try {
       localStorage.setItem(STORAGE_ITEMS_KEY, JSON.stringify(items));
     } catch (e) {}
+    if (serverOnline && serverStorageMode !== 'none') {
+      fetch('/api/monitors', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ items: items })
+      }).catch(function () {});
+    }
   }
 
   function getAlerts() {
     try {
-      return JSON.parse(localStorage.getItem(STORAGE_ALERTS_KEY) || '[]');
+      var parsed = JSON.parse(localStorage.getItem(STORAGE_ALERTS_KEY) || '[]');
+      return Array.isArray(parsed) ? parsed : [];
     } catch (e) {
       return [];
     }
@@ -27,28 +95,108 @@
 
   function saveAlerts(alerts) {
     try {
-      localStorage.setItem(STORAGE_ALERTS_KEY, JSON.stringify(alerts));
+      localStorage.setItem(STORAGE_ALERTS_KEY, JSON.stringify(alerts.slice(-300)));
     } catch (e) {}
   }
 
-  function generateId() {
-    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
-      return window.crypto.randomUUID();
+  function getConfig() {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_CFG_KEY) || '{}') || {};
+    } catch (e) {
+      return {};
     }
-    return 'id-' + Date.now() + '-' + Math.random().toString(36).substring(2, 9);
   }
 
-  // Classificador automático se o item encontrado é Chave (Key) ou Conta
-  function detectDeliveryType(title, store, extraText) {
-    var combined = (String(title || '') + ' ' + String(extraText || '')).toLowerCase();
-    var accountKeywords = [
-      'conta ', 'conta-', 'account', 'offline', 'compartilhada', 'primária', 'primaria',
-      'secundária', 'secundaria', 'steam account', 'psn account', 'xbox account', 'acesso completo'
-    ];
-    for (var i = 0; i < accountKeywords.length; i++) {
-      if (combined.indexOf(accountKeywords[i]) !== -1) {
-        return 'Conta';
+  // --- Relevância & Classificação (espelha backend para modo offline/PWA) ---
+  var STOPWORDS = {
+    de: 1, da: 1, do: 1, das: 1, dos: 1, e: 1, a: 1, o: 1, as: 1, os: 1,
+    em: 1, para: 1, por: 1, com: 1, the: 1, of: 1, and: 1, for: 1, to: 1, in: 1, on: 1
+  };
+
+  function normalizeText(text) {
+    return String(text || '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .replace(/([a-z])(\d)/g, '$1 $2')
+      .replace(/(\d)([a-z])/g, '$1 $2')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim();
+  }
+
+  function extractTokens(term) {
+    var norm = normalizeText(term);
+    if (!norm) return [];
+    var all = norm.split(' ').filter(Boolean);
+    var filtered = all.filter(function (t) { return !STOPWORDS[t]; });
+    return filtered.length ? filtered : all;
+  }
+
+  function escapeRegex(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  function matchesSearchTerm(offerTitle, searchTerm) {
+    var qTokens = extractTokens(searchTerm);
+    if (!qTokens.length) return true;
+    var normTitle = normalizeText(offerTitle);
+    var normTerm = normalizeText(searchTerm);
+    if (!normTitle) return false;
+
+    if (normTerm && !/\b(for|para|compativel|compatible)\b/.test(normTerm)) {
+      var compatRe = new RegExp('\\b(for|para|on|compativel\\s+com|compatible\\s+with)\\s+' + escapeRegex(normTerm) + '\\b', 'g');
+      if (compatRe.test(normTitle)) {
+        var stripped = normTitle.replace(compatRe, ' ').replace(/\s+/g, ' ').trim();
+        var strippedTokens = stripped.split(' ').filter(Boolean);
+        var stillMatches = qTokens.every(function (qt) { return strippedTokens.indexOf(qt) !== -1; });
+        if (!stillMatches) return false;
       }
+    }
+
+    var titleTokens = normTitle.split(' ').filter(Boolean);
+    return qTokens.every(function (qt) {
+      return titleTokens.some(function (tt) {
+        if (tt === qt) return true;
+        if (/^[a-z]{4,}$/.test(qt)) {
+          return tt === qt + 's' || qt === tt + 's';
+        }
+        return false;
+      });
+    });
+  }
+
+  function detectQueryCategory(term) {
+    var norm = normalizeText(term);
+    if (/\b(windows\s*(7|8|10|11|server|pro|home)?|(microsoft\s*)?office\s*(365|2016|2019|2021|2024)?|microsoft\s*365|adobe|photoshop|coreldraw|autocad|antivirus|kaspersky|norton|bitdefender|licenca\s+digital)\b/i.test(norm)) {
+      return 'Software';
+    }
+    if (/\b(rtx|gtx|radeon|ryzen|core\s*i[3579]|ssd|nvme|ddr[45]|placa\s*de\s*video|placa\s*mae|monitor\s*gamer|teclado\s*mecanico)\b/i.test(norm)) {
+      return 'Hardware';
+    }
+    if (/\b(iphone|ipad|macbook|samsung\s*galaxy|xiaomi|notebook|laptop|smart\s*tv|kindle|playstation\s*5|xbox\s*series|nintendo\s*switch)\b/i.test(norm)) {
+      return 'Eletrônicos';
+    }
+    return 'Jogos';
+  }
+
+  function detectDeliveryType(title, store, extraText) {
+    var combined = String(title || '') + ' ' + String(extraText || '');
+    var accountPatterns = [
+      /\bconta\s+(compartilhada|prim[aá]ria|secund[aá]ria|offline|steam|psn|xbox|epic|completa)\b/i,
+      /\b(steam|psn|xbox|epic|gog|microsoft)\s+account\b/i,
+      /\b(shared|offline|full\s+access)\s+account\b/i
+    ];
+    for (var i = 0; i < accountPatterns.length; i++) {
+      if (accountPatterns[i].test(combined)) return 'Conta';
+    }
+
+    if (/\b(cd[-\s]?key|steam\s+key|global\s+key|product\s+key|chave|licen[çc]a|serial|esd|oem|retail|voucher|key)\b/i.test(combined)) {
+      return 'Chave (Key)';
+    }
+
+    var s = String(store || '').toLowerCase();
+    if (s === 'steam' || s === 'gog' || s.indexOf('epic') !== -1) {
+      return 'Ativação Direta (Conta)';
     }
     return 'Chave (Key)';
   }
@@ -58,6 +206,9 @@
     if (dtype === 'Conta') {
       return '<span class="tag account-badge">👤 Conta</span>';
     }
+    if (dtype === 'Ativação Direta (Conta)') {
+      return '<span class="tag direct-badge">⚡ Ativação Direta</span>';
+    }
     return '<span class="tag key-badge">🔑 Chave (Key)</span>';
   }
 
@@ -65,23 +216,76 @@
     return curr === 'USD' ? 'US$' : 'R$';
   }
 
+  function formatCurrLabel(curr) {
+    if (curr === 'BRL') return 'Somente Real (R$)';
+    if (curr === 'USD') return 'Somente Dólar (US$)';
+    return 'Livre (BRL + USD)';
+  }
+
+  // --- Fontes por categoria ---
   var SOURCES_BY_CATEGORY = {
-    Jogos: [
+    Auto: [
       { name: 'Google Shopping', defaultChecked: true },
+      { name: 'Mercado Livre', defaultChecked: true },
+      { name: 'Amazon', defaultChecked: true },
+      { name: 'KaBuM!', defaultChecked: true },
+      { name: 'Buscapé', defaultChecked: true },
       { name: 'Steam', defaultChecked: true },
-      { name: 'Epic Games', defaultChecked: true },
       { name: 'GOG', defaultChecked: true },
+      { name: 'Epic Games', defaultChecked: true },
       { name: 'Nuuvem', defaultChecked: true },
-      { name: 'Amazon', defaultChecked: true },
-      { name: 'Promobit (RSS)', defaultChecked: false },
+      { name: 'AllKeyShop', defaultChecked: true },
+      { name: 'CheapShark (USD)', defaultChecked: true },
       { name: 'Sites de cupons', defaultChecked: true },
-      { name: 'CheapShark (USD)', defaultChecked: true }
+      { name: 'Promobit (RSS)', defaultChecked: false }
     ],
-    Default: [
+    Jogos: [
+      { name: 'Steam', defaultChecked: true },
+      { name: 'GOG', defaultChecked: true },
+      { name: 'Epic Games', defaultChecked: true },
+      { name: 'Nuuvem', defaultChecked: true },
+      { name: 'CheapShark (USD)', defaultChecked: true },
+      { name: 'AllKeyShop', defaultChecked: true },
       { name: 'Google Shopping', defaultChecked: true },
       { name: 'Amazon', defaultChecked: true },
-      { name: 'Promobit (RSS)', defaultChecked: true },
-      { name: 'Sites de cupons', defaultChecked: true }
+      { name: 'Sites de cupons', defaultChecked: true },
+      { name: 'Promobit (RSS)', defaultChecked: false }
+    ],
+    Software: [
+      { name: 'Google Shopping', defaultChecked: true },
+      { name: 'Mercado Livre', defaultChecked: true },
+      { name: 'Amazon', defaultChecked: true },
+      { name: 'KaBuM!', defaultChecked: true },
+      { name: 'Buscapé', defaultChecked: true },
+      { name: 'AllKeyShop', defaultChecked: true },
+      { name: 'Sites de cupons', defaultChecked: true },
+      { name: 'Promobit (RSS)', defaultChecked: true }
+    ],
+    Hardware: [
+      { name: 'Google Shopping', defaultChecked: true },
+      { name: 'KaBuM!', defaultChecked: true },
+      { name: 'Mercado Livre', defaultChecked: true },
+      { name: 'Amazon', defaultChecked: true },
+      { name: 'Buscapé', defaultChecked: true },
+      { name: 'Sites de cupons', defaultChecked: true },
+      { name: 'Promobit (RSS)', defaultChecked: true }
+    ],
+    'Eletrônicos': [
+      { name: 'Google Shopping', defaultChecked: true },
+      { name: 'Mercado Livre', defaultChecked: true },
+      { name: 'Amazon', defaultChecked: true },
+      { name: 'KaBuM!', defaultChecked: true },
+      { name: 'Buscapé', defaultChecked: true },
+      { name: 'Sites de cupons', defaultChecked: true },
+      { name: 'Promobit (RSS)', defaultChecked: true }
+    ],
+    Outros: [
+      { name: 'Google Shopping', defaultChecked: true },
+      { name: 'Mercado Livre', defaultChecked: true },
+      { name: 'Amazon', defaultChecked: true },
+      { name: 'Buscapé', defaultChecked: true },
+      { name: 'Sites de cupons', defaultChecked: true },
+      { name: 'Promobit (RSS)', defaultChecked: true }
     ]
   };
 
@@ -96,222 +300,139 @@
   function renderSourceChips(containerId, category, inputClass) {
     var container = document.getElementById(containerId);
     if (!container) return;
-    var list = SOURCES_BY_CATEGORY[category] || SOURCES_BY_CATEGORY.Default;
+    var list = SOURCES_BY_CATEGORY[category] || SOURCES_BY_CATEGORY.Outros;
     container.innerHTML = list.map(function (src) {
+      var safeName = escapeHtml(src.name);
       return (
         '<label class="source-chip ' + (src.defaultChecked ? 'selected' : '') + '">' +
-          '<input type="checkbox" class="' + inputClass + '" value="' + src.name + '" ' + (src.defaultChecked ? 'checked' : '') + ' />' +
-          '<span>' + src.name + '</span>' +
+          '<input type="checkbox" class="' + escapeHtml(inputClass) + '" value="' + safeName + '" ' + (src.defaultChecked ? 'checked' : '') + ' />' +
+          '<span>' + safeName + '</span>' +
         '</label>'
       );
     }).join('');
 
     var chips = container.querySelectorAll('.source-chip');
-    for (var i = 0; i < chips.length; i++) {
-      (function (chip) {
-        var chk = chip.querySelector('input');
-        chk.addEventListener('change', function () {
-          if (chk.checked) chip.classList.add('selected');
-          else chip.classList.remove('selected');
-        });
-      })(chips[i]);
-    }
-  }
-
-  var categorySelect = document.getElementById('item-category');
-  var sourcesLegend = document.getElementById('sources-legend');
-  var currencySelect = document.getElementById('item-currency');
-  var targetLabel = document.getElementById('label-item-target');
-
-  function updateCategorySources() {
-    if (!categorySelect || !sourcesLegend) return;
-    var cat = categorySelect.value;
-    sourcesLegend.textContent = 'Fontes (' + cat + ')';
-    renderSourceChips('sources-chips-container', cat, 'src-chk');
-  }
-
-  function updateCurrencyLabel() {
-    if (!currencySelect || !targetLabel) return;
-    var val = currencySelect.value;
-    if (val === 'USD') {
-      targetLabel.textContent = 'Preço-alvo (US$)';
-    } else if (val === 'BRL') {
-      targetLabel.textContent = 'Preço-alvo (R$)';
-    } else {
-      targetLabel.textContent = 'Preço-alvo (R$ / Livre)';
-    }
-  }
-
-  if (categorySelect) categorySelect.addEventListener('change', updateCategorySources);
-  if (currencySelect) currencySelect.addEventListener('change', updateCurrencyLabel);
-
-  var tabButtons = document.querySelectorAll('.nav-tab');
-  for (var t = 0; t < tabButtons.length; t++) {
-    (function (btn) {
-      btn.addEventListener('click', function () {
-        for (var j = 0; j < tabButtons.length; j++) tabButtons[j].classList.remove('active');
-        var panels = document.querySelectorAll('.tab-panel');
-        for (var k = 0; k < panels.length; k++) panels[k].classList.remove('active');
-        btn.classList.add('active');
-        var targetPanel = document.getElementById(btn.getAttribute('data-tab'));
-        if (targetPanel) targetPanel.classList.add('active');
+    chips.forEach(function (chip) {
+      var chk = chip.querySelector('input');
+      if (!chk) return;
+      chk.addEventListener('change', function () {
+        chip.classList.toggle('selected', chk.checked);
       });
-    })(tabButtons[t]);
+    });
   }
 
-  // Busca Real Híbrida com filtro de Moeda (ALL / BRL / USD) e identificação de Chave (Key) ou Conta
-  async function directBrowserSearch(term, sources, currencyFilter) {
+  // --- Navegação por Abas ---
+  var tabButtons = document.querySelectorAll('.nav-tab');
+  tabButtons.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      tabButtons.forEach(function (b) {
+        b.classList.remove('active');
+        b.setAttribute('aria-selected', 'false');
+      });
+      document.querySelectorAll('.tab-panel').forEach(function (p) {
+        p.classList.remove('active');
+      });
+      btn.classList.add('active');
+      btn.setAttribute('aria-selected', 'true');
+      var targetPanel = document.getElementById(btn.getAttribute('data-tab'));
+      if (targetPanel) targetPanel.classList.add('active');
+    });
+  });
+
+  // --- Busca Direta (fallback offline/PWA sem proxy de terceiros) ---
+  async function directBrowserSearch(term, sources, currencyFilter, category) {
     var offers = [];
     var errors = [];
     var currMode = currencyFilter || 'ALL';
+    var detected = category && category !== 'Auto' ? category : detectQueryCategory(term);
+    var effectiveSources = sources.slice();
 
-    var tasks = sources.map(async function (src) {
+    if (category === 'Auto' && detected !== 'Jogos') {
+      effectiveSources = effectiveSources.filter(function (s) {
+        return ['Steam', 'GOG', 'Epic Games', 'Nuuvem', 'CheapShark (USD)', 'CheapShark'].indexOf(s) === -1;
+      });
+      ['Google Shopping', 'Mercado Livre', 'Amazon', 'KaBuM!', 'Buscapé', 'AllKeyShop', 'Sites de cupons'].forEach(function (s) {
+        if (effectiveSources.indexOf(s) === -1) effectiveSources.push(s);
+      });
+    }
+
+    var tasks = effectiveSources.map(async function (src) {
       try {
-        if (src === 'CheapShark (USD)' || src === 'CheapShark') {
-          var csUrl = 'https://www.cheapshark.com/api/1.0/deals?title=' + encodeURIComponent(term) + '&pageSize=12&sortBy=Price';
-          var r = await fetch(csUrl);
+        if (src === 'CheapShark (USD)' || src === 'CheapShark' || src === 'Epic Games' || src === 'GOG' || src === 'Steam') {
+          var storeParam = src === 'Steam' ? '&storeID=1' : (src === 'Epic Games' ? '&storeID=25' : (src === 'GOG' ? '&storeID=7' : ''));
+          var r = await fetch('https://www.cheapshark.com/api/1.0/deals?title=' + encodeURIComponent(term) + '&pageSize=12&sortBy=Price' + storeParam);
           if (r.ok) {
             var data = await r.json();
-            data.forEach(function (d) {
-              var stName = CS_STORES[String(d.storeID)] || ('CheapShark #' + d.storeID);
-              var title = d.title || term;
-              offers.push({
-                name: title,
-                store: stName,
-                kind: 'Revendedor',
-                delivery_type: detectDeliveryType(title, stName),
-                currency: 'USD',
-                price: parseFloat(d.salePrice || '0'),
-                original_price: parseFloat(d.normalPrice || '0'),
-                discount: parseFloat(d.savings || '0'),
-                url: 'https://www.cheapshark.com/redirect?dealID=' + (d.dealID || ''),
-                thumb: d.thumb || ''
-              });
-            });
-          }
-        } else if (src === 'Steam') {
-          var steamFound = false;
-          try {
-            var proxyUrl = 'https://api.allorigins.win/raw?url=' + encodeURIComponent('https://store.steampowered.com/api/storesearch/?term=' + encodeURIComponent(term) + '&cc=br&l=brazilian');
-            var sr = await fetch(proxyUrl);
-            if (sr.ok) {
-              var sdata = await sr.json();
-              var sitems = (sdata.items || []).slice(0, 6);
-              sitems.forEach(function (app) {
-                if (app.price && app.price.final) {
-                  steamFound = true;
-                  var finalPrice = app.price.final / 100;
-                  var initPrice = (app.price.initial || app.price.final) / 100;
-                  var disc = initPrice > finalPrice ? Math.round(((initPrice - finalPrice) / initPrice) * 100) : 0;
-                  var title = app.name || term;
-                  offers.push({
-                    name: title,
-                    store: 'Steam',
-                    kind: 'Loja oficial',
-                    delivery_type: detectDeliveryType(title, 'Steam'),
-                    currency: 'BRL',
-                    price: finalPrice,
-                    original_price: initPrice,
-                    discount: disc,
-                    url: 'https://store.steampowered.com/app/' + app.id + '/',
-                    thumb: app.tiny_image || ''
-                  });
-                }
-              });
-            }
-          } catch (e) {}
-
-          if (!steamFound) {
-            var stCs = await fetch('https://www.cheapshark.com/api/1.0/deals?storeID=1&title=' + encodeURIComponent(term) + '&pageSize=6');
-            if (stCs.ok) {
-              var stData = await stCs.json();
-              stData.forEach(function (d) {
-                var title = d.title || term;
+            if (Array.isArray(data)) {
+              data.forEach(function (d) {
+                var title = String(d.title || '');
+                if (!title || !matchesSearchTerm(title, term)) return;
+                var stName = src === 'CheapShark (USD)' || src === 'CheapShark'
+                  ? (CS_STORES[String(d.storeID)] || ('CheapShark #' + d.storeID))
+                  : src;
                 offers.push({
                   name: title,
-                  store: 'Steam',
-                  kind: 'Loja oficial',
-                  delivery_type: detectDeliveryType(title, 'Steam'),
+                  store: stName,
+                  kind: src === 'Steam' || src === 'GOG' || src === 'Epic Games' ? 'Loja oficial' : 'Revendedor',
+                  delivery_type: detectDeliveryType(title, stName),
                   currency: 'USD',
                   price: parseFloat(d.salePrice || '0'),
                   original_price: parseFloat(d.normalPrice || '0'),
                   discount: parseFloat(d.savings || '0'),
-                  url: d.steamAppID ? ('https://store.steampowered.com/app/' + d.steamAppID + '/') : ('https://www.cheapshark.com/redirect?dealID=' + d.dealID),
+                  url: 'https://www.cheapshark.com/redirect?dealID=' + encodeURIComponent(d.dealID || ''),
                   thumb: d.thumb || ''
                 });
               });
             }
           }
-        } else if (src === 'Epic Games') {
-          var epRes = await fetch('https://www.cheapshark.com/api/1.0/deals?storeID=25&title=' + encodeURIComponent(term) + '&pageSize=6');
-          var epAdded = false;
-          if (epRes.ok) {
-            var epData = await epRes.json();
-            epData.forEach(function (d) {
-              epAdded = true;
-              var title = d.title || term;
-              offers.push({
-                name: title,
-                store: 'Epic Games',
-                kind: 'Loja oficial',
-                delivery_type: detectDeliveryType(title, 'Epic Games'),
-                currency: 'USD',
-                price: parseFloat(d.salePrice || '0'),
-                original_price: parseFloat(d.normalPrice || '0'),
-                discount: parseFloat(d.savings || '0'),
-                url: 'https://www.cheapshark.com/redirect?dealID=' + (d.dealID || ''),
-                thumb: d.thumb || ''
-              });
-            });
-          }
-          if (!epAdded) {
-            offers.push({
-              name: term + ' (Ver na Epic Games Store)',
-              store: 'Epic Games',
-              kind: 'Comparador / Loja',
-              delivery_type: detectDeliveryType(term, 'Epic Games'),
-              currency: 'BRL',
-              price: 0,
-              original_price: 0,
-              discount: 0,
-              url: 'https://store.epicgames.com/pt-BR/browse?q=' + encodeURIComponent(term) + '&sortBy=relevancy'
-            });
-          }
-        } else if (src === 'GOG') {
-          var gogRes = await fetch('https://www.cheapshark.com/api/1.0/deals?storeID=7&title=' + encodeURIComponent(term) + '&pageSize=6');
-          var gogAdded = false;
-          if (gogRes.ok) {
-            var gogData = await gogRes.json();
-            gogData.forEach(function (d) {
-              gogAdded = true;
-              var title = d.title || term;
-              offers.push({
-                name: title,
-                store: 'GOG',
-                kind: 'Loja oficial',
-                delivery_type: detectDeliveryType(title, 'GOG'),
-                currency: 'USD',
-                price: parseFloat(d.salePrice || '0'),
-                original_price: parseFloat(d.normalPrice || '0'),
-                discount: parseFloat(d.savings || '0'),
-                url: 'https://www.cheapshark.com/redirect?dealID=' + (d.dealID || ''),
-                thumb: d.thumb || ''
-              });
-            });
-          }
-          if (!gogAdded) {
-            offers.push({
-              name: term + ' (Catálogo GOG)',
-              store: 'GOG',
-              kind: 'Comparador / Loja',
-              delivery_type: detectDeliveryType(term, 'GOG'),
-              currency: 'BRL',
-              price: 0,
-              original_price: 0,
-              discount: 0,
-              url: 'https://www.gog.com/en/games?query=' + encodeURIComponent(term)
-            });
-          }
+        } else if (src === 'Mercado Livre') {
+          offers.push({
+            name: term + ' (Buscar ofertas no Mercado Livre)',
+            store: 'Mercado Livre',
+            kind: 'Comparador / Loja',
+            delivery_type: detectDeliveryType(term, 'Mercado Livre'),
+            currency: 'BRL',
+            price: 0,
+            original_price: 0,
+            discount: 0,
+            url: 'https://lista.mercadolivre.com.br/' + encodeURIComponent(term.trim().replace(/\s+/g, '-'))
+          });
+        } else if (src === 'KaBuM!') {
+          offers.push({
+            name: term + ' (Buscar na KaBuM!)',
+            store: 'KaBuM!',
+            kind: 'Comparador / Loja',
+            delivery_type: detectDeliveryType(term, 'KaBuM!'),
+            currency: 'BRL',
+            price: 0,
+            original_price: 0,
+            discount: 0,
+            url: 'https://www.kabum.com.br/busca/' + encodeURIComponent(term.trim().replace(/\s+/g, '-'))
+          });
+        } else if (src === 'Buscapé') {
+          offers.push({
+            name: term + ' (Comparar preços no Buscapé)',
+            store: 'Buscapé',
+            kind: 'Comparador / Loja',
+            delivery_type: detectDeliveryType(term, 'Buscapé'),
+            currency: 'BRL',
+            price: 0,
+            original_price: 0,
+            discount: 0,
+            url: 'https://www.buscape.com.br/search?q=' + encodeURIComponent(term)
+          });
+        } else if (src === 'AllKeyShop') {
+          offers.push({
+            name: term + ' (Comparar chaves no AllKeyShop)',
+            store: 'AllKeyShop',
+            kind: 'Comparador / Loja',
+            delivery_type: 'Chave (Key)',
+            currency: 'USD',
+            price: 0,
+            original_price: 0,
+            discount: 0,
+            url: 'https://www.allkeyshop.com/blog/catalogue/search-' + encodeURIComponent(term) + '/'
+          });
         } else if (src === 'Nuuvem') {
           offers.push({
             name: term + ' (Chave de Ativação - Nuuvem Brasil)',
@@ -326,7 +447,7 @@
           });
         } else if (src === 'Google Shopping') {
           offers.push({
-            name: term + ' (Chaves e Contas no Google Shopping)',
+            name: term + ' (Ofertas no Google Shopping)',
             store: 'Google Shopping',
             kind: 'Comparador / Loja',
             delivery_type: detectDeliveryType(term, 'Google Shopping'),
@@ -362,7 +483,7 @@
           });
         } else if (src === 'Promobit (RSS)' || src === 'RSS') {
           offers.push({
-            name: term + ' (Ofertas na Comunidade Promobit)',
+            name: term + ' (Comunidade de Ofertas Promobit)',
             store: 'Promobit (RSS)',
             kind: 'Comparador / Loja',
             delivery_type: detectDeliveryType(term, 'Promobit'),
@@ -389,12 +510,14 @@
       if (a.price === 0 && b.price > 0) return 1;
       return a.price - b.price;
     });
-    return { offers: offers, errors: errors };
+
+    return { offers: offers, errors: errors, detected_category: detected, usd_to_brl_rate: null };
   }
 
-  async function executeRealSearch(term, sources, currencyFilter) {
+  async function executeRealSearch(term, sources, currencyFilter, category) {
     var currMode = currencyFilter || 'ALL';
-    var savedCfg = JSON.parse(localStorage.getItem(STORAGE_CFG_KEY) || '{}');
+    var catMode = category || 'Auto';
+    var savedCfg = getConfig();
     if (window.location.protocol.startsWith('http')) {
       try {
         var res = await fetch('/api/search', {
@@ -404,6 +527,7 @@
             term: term,
             sources: sources,
             currency: currMode,
+            category: catMode,
             rss_feeds: savedCfg.rss_feeds || []
           })
         });
@@ -413,70 +537,272 @@
         }
       } catch (e) {}
     }
-    return await directBrowserSearch(term, sources, currMode);
+    return await directBrowserSearch(term, sources, currMode, catMode);
   }
 
-  function renderOfferListHTML(offers, errors) {
-    if (!offers || !offers.length) {
-      return '<p style="color:var(--muted);">Nenhuma oferta encontrada com o filtro de moeda selecionado. ' + (errors || []).join(' ') + '</p>';
+  // Chama o endpoint real /api/scan (dispara SMTP/Telegram/WhatsApp + deduplicação)
+  async function executeRealScan(activeItems) {
+    var savedCfg = getConfig();
+    var existingAlerts = getAlerts();
+    var existingKeys = existingAlerts.map(function (a) {
+      return a.dedup_key || buildDedupKey(a.item_id, a);
+    });
+
+    if (window.location.protocol.startsWith('http')) {
+      try {
+        var res = await fetch('/api/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            items: activeItems,
+            config: {
+              rss_feeds: savedCfg.rss_feeds || [],
+              telegram_chat_id: savedCfg.telegram_chat_id || undefined
+            },
+            existing_alert_keys: existingKeys
+          })
+        });
+        if (res.ok) {
+          var data = await res.json();
+          if (data && Array.isArray(data.results)) {
+            return { viaServer: true, results: data.results };
+          }
+        }
+      } catch (e) {}
     }
-    return offers.map(function (o) {
-      var hasPrice = Number(o.price) > 0;
-      var sym = formatCurrencySymbol(o.currency);
-      var deliveryBadge = formatDeliveryBadge(o.delivery_type || detectDeliveryType(o.name, o.store));
 
-      var priceHtml = hasPrice
-        ? '<span style="color:#34d399; font-weight:700; font-size:0.98rem;">' + sym + ' ' + Number(o.price).toFixed(2) + ' (' + o.currency + ')</span>' +
-          (Number(o.original_price) > Number(o.price) ? ' <s style="color:var(--muted); font-size:0.8rem;">' + sym + ' ' + Number(o.original_price).toFixed(2) + '</s>' : '') +
-          (Number(o.discount) > 0 ? '<span class="tag green" style="margin-left:8px;">-' + Math.round(o.discount) + '%</span>' : '')
-        : '<span class="tag">Catálogo (' + o.currency + ')</span>';
+    // Fallback offline no navegador
+    var seenSet = {};
+    existingKeys.forEach(function (k) { seenSet[k] = true; });
+    var fallbackResults = [];
 
-      var thumbHtml = o.thumb
-        ? '<img src="' + o.thumb + '" alt="" class="offer-thumb" loading="lazy" />'
-        : '';
+    for (var i = 0; i < activeItems.length; i++) {
+      var item = activeItems[i];
+      var sRes = await directBrowserSearch(item.name, item.sources, item.currency_filter || 'ALL', item.category || 'Auto');
+      var itemAlerts = [];
+      (sRes.offers || []).forEach(function (off) {
+        if (!qualifiesOffer(item, off)) return;
+        var dk = buildDedupKey(item.id, off);
+        if (seenSet[dk]) return;
+        seenSet[dk] = true;
+        itemAlerts.push({
+          id: generateId(),
+          item_id: item.id,
+          dedup_key: dk,
+          name: off.name,
+          store: off.store,
+          delivery_type: off.delivery_type || detectDeliveryType(off.name, off.store),
+          currency: off.currency,
+          original_price: off.original_price,
+          price: off.price,
+          price_brl_estimated: off.price_brl_estimated,
+          discount: off.discount,
+          url: off.url,
+          created_at: new Date().toISOString(),
+          notified: 'Painel (offline)'
+        });
+      });
+      fallbackResults.push({
+        item_id: item.id,
+        item: item.name,
+        offers: sRes.offers || [],
+        alerts: itemAlerts,
+        errors: sRes.errors || [],
+        usd_to_brl_rate: sRes.usd_to_brl_rate || null,
+        detected_category: sRes.detected_category
+      });
+    }
 
-      return (
-        '<div class="list-item">' +
-          '<div class="offer-left">' +
-            thumbHtml +
-            '<div>' +
-              '<strong>' + o.name + '</strong>' +
-              '<div style="font-size:0.84rem; color:var(--muted); margin-top:4px; display:flex; align-items:center; flex-wrap:wrap; gap:4px;">' +
-                '<span class="tag">' + o.store + '</span>' +
-                deliveryBadge +
-                priceHtml +
-              '</div>' +
+    return { viaServer: false, results: fallbackResults };
+  }
+
+  function qualifiesOffer(item, offer) {
+    if (Number(offer.price) <= 0) return false;
+    var filterCurr = item.currency_filter || 'ALL';
+    if (filterCurr !== 'ALL' && offer.currency !== filterCurr) return false;
+
+    var hasRule = item.target_price !== null || item.min_discount !== null;
+    if (!hasRule) return false;
+
+    var priceOk = false;
+    if (item.target_price !== null) {
+      if (filterCurr === 'ALL') {
+        if (offer.currency === 'BRL') {
+          priceOk = Number(offer.price) <= Number(item.target_price);
+        } else if (offer.currency === 'USD' && offer.price_brl_estimated) {
+          priceOk = Number(offer.price_brl_estimated) <= Number(item.target_price);
+        }
+      } else if (offer.currency === filterCurr) {
+        priceOk = Number(offer.price) <= Number(item.target_price);
+      }
+    }
+    var discountOk = item.min_discount !== null && Number(offer.discount) >= Number(item.min_discount);
+    return priceOk || discountOk;
+  }
+
+  // --- Renderização segura de ofertas (separa preços reais vs links de busca) ---
+  function renderSingleOfferCard(o) {
+    var hasPrice = Number(o.price) > 0;
+    var sym = formatCurrencySymbol(o.currency);
+    var deliveryBadge = formatDeliveryBadge(o.delivery_type || detectDeliveryType(o.name, o.store));
+
+    var priceHtml = hasPrice
+      ? '<span class="price-highlight">' + escapeHtml(sym) + ' ' + Number(o.price).toFixed(2) + ' (' + escapeHtml(o.currency) + ')</span>' +
+        (o.currency === 'USD' && o.price_brl_estimated ? '<span class="price-est">≈ R$ ' + Number(o.price_brl_estimated).toFixed(2) + '</span>' : '') +
+        (Number(o.original_price) > Number(o.price) ? '<s class="price-old">' + escapeHtml(sym) + ' ' + Number(o.original_price).toFixed(2) + '</s>' : '') +
+        (Number(o.discount) > 0 ? '<span class="tag green">-' + Math.round(Number(o.discount)) + '%</span>' : '')
+      : '<span class="tag">Busca direta (' + escapeHtml(o.currency) + ')</span>';
+
+    var safeThumb = o.thumb ? safeUrl(o.thumb) : '#';
+    var thumbHtml = safeThumb !== '#'
+      ? '<img src="' + escapeHtml(safeThumb) + '" alt="" class="offer-thumb" loading="lazy" />'
+      : '';
+
+    var linkUrl = safeUrl(o.url);
+
+    return (
+      '<div class="list-item">' +
+        '<div class="offer-left">' +
+          thumbHtml +
+          '<div>' +
+            '<strong>' + escapeHtml(o.name) + '</strong>' +
+            '<div class="offer-meta">' +
+              '<span class="tag">' + escapeHtml(o.store) + '</span>' +
+              deliveryBadge +
+              priceHtml +
             '</div>' +
           '</div>' +
-          '<a href="' + o.url + '" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm" style="text-decoration:none;">Abrir Oferta ↗</a>' +
-        '</div>'
-      );
-    }).join('');
+        '</div>' +
+        '<a href="' + escapeHtml(linkUrl) + '" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">' +
+          (hasPrice ? 'Abrir Oferta ↗' : 'Pesquisar na Loja ↗') +
+        '</a>' +
+      '</div>'
+    );
   }
 
+  function renderOfferListHTML(offers, errors, meta) {
+    var parts = [];
+    if (meta && (meta.detected_category || meta.usd_to_brl_rate)) {
+      var metaChips = [];
+      if (meta.detected_category) {
+        metaChips.push('<span class="tag">Categoria: ' + escapeHtml(meta.detected_category) + '</span>');
+      }
+      if (meta.usd_to_brl_rate) {
+        metaChips.push('<span class="tag green">Cotação USD → BRL: R$ ' + Number(meta.usd_to_brl_rate).toFixed(2) + '</span>');
+      }
+      parts.push('<div class="meta-bar">' + metaChips.join('') + '</div>');
+    }
+
+    if (errors && errors.length) {
+      parts.push(
+        '<p style="color:#fca5a5; font-size:0.84rem; margin-bottom:12px;">Avisos: ' +
+          escapeHtml(errors.join(' • ')) +
+        '</p>'
+      );
+    }
+
+    if (!offers || !offers.length) {
+      parts.push('<p style="color:var(--muted);">Nenhuma oferta compatível encontrada com os filtros selecionados.</p>');
+      return parts.join('');
+    }
+
+    var priced = offers.filter(function (o) { return Number(o.price) > 0; });
+    var catalog = offers.filter(function (o) { return Number(o.price) <= 0; });
+
+    if (priced.length) {
+      parts.push('<div class="section-divider">Ofertas com preço em tempo real (' + priced.length + ')</div>');
+      parts.push(priced.map(renderSingleOfferCard).join(''));
+    }
+
+    if (catalog.length) {
+      parts.push('<div class="section-divider">Links diretos de pesquisa nas lojas (' + catalog.length + ')</div>');
+      parts.push(catalog.map(renderSingleOfferCard).join(''));
+    }
+
+    return parts.join('');
+  }
+
+  // --- Healthcheck & Capabilities ---
   async function checkServerHealth() {
     var pill = document.getElementById('server-status');
     var txt = document.getElementById('status-text');
+    var capsEl = document.getElementById('server-capabilities');
     if (!pill || !txt) return;
+
     if (window.location.protocol.startsWith('http')) {
       try {
         var res = await fetch('/api/health', { cache: 'no-store' });
         if (res.ok) {
+          var info = await res.json();
+          serverOnline = true;
+          serverStorageMode = info.storage || 'none';
           pill.classList.remove('offline');
-          txt.textContent = 'Servidor online (API ativa)';
+          txt.textContent = 'Servidor online (v' + (info.version || '5.1') + ')';
+
+          if (capsEl && info.notifications) {
+            var n = info.notifications;
+            capsEl.innerHTML =
+              '<span class="tag ' + (n.email ? 'green' : 'paused') + '">SMTP E-mail: ' + (n.email ? 'Configurado' : 'Pendente no servidor') + '</span>' +
+              '<span class="tag ' + (n.telegram ? 'green' : 'paused') + '">Telegram: ' + (n.telegram ? 'Configurado' : 'Pendente no servidor') + '</span>' +
+              '<span class="tag ' + (n.whatsapp ? 'green' : 'paused') + '">WhatsApp: ' + (n.whatsapp ? 'Configurado' : 'Pendente no servidor') + '</span>' +
+              '<span class="tag ' + (serverStorageMode !== 'none' ? 'green' : 'paused') + '">Persistência Cron: ' + escapeHtml(serverStorageMode) + '</span>';
+          }
+
+          if (serverStorageMode !== 'none') {
+            syncFromServerIfLocalEmpty();
+          }
           return;
         }
       } catch (e) {}
     }
-    pill.classList.remove('offline');
-    txt.textContent = 'Busca Direta Ativa (PWA)';
+
+    serverOnline = false;
+    pill.classList.add('offline');
+    txt.textContent = 'Modo Offline (PWA)';
   }
 
+  async function syncFromServerIfLocalEmpty() {
+    if (getItems().length > 0) return;
+    try {
+      var res = await fetch('/api/monitors', { cache: 'no-store' });
+      if (!res.ok) return;
+      var data = await res.json();
+      if (Array.isArray(data.items) && data.items.length > 0) {
+        localStorage.setItem(STORAGE_ITEMS_KEY, JSON.stringify(data.items));
+        renderMonitors();
+      }
+      if (Array.isArray(data.alerts) && data.alerts.length > 0 && getAlerts().length === 0) {
+        saveAlerts(data.alerts);
+        renderAlerts();
+      }
+    } catch (e) {}
+  }
+
+  // --- Controles de Formulário ---
+  var categorySelect = document.getElementById('item-category');
+  var sourcesLegend = document.getElementById('sources-legend');
+  var currencySelect = document.getElementById('item-currency');
+  var targetLabel = document.getElementById('label-item-target');
   var chkMonitorar = document.getElementById('chk-monitorar');
   var inputEmail = document.getElementById('dest-email');
   var emailReqStar = document.getElementById('email-req-star');
   var monitorBadgeState = document.getElementById('monitor-badge-state');
   var chkChannelEmail = document.getElementById('chn-email');
+
+  function updateCategorySources() {
+    if (!categorySelect || !sourcesLegend) return;
+    var cat = categorySelect.value;
+    sourcesLegend.textContent = 'Fontes (' + cat + ')';
+    renderSourceChips('sources-chips-container', cat, 'src-chk');
+  }
+
+  function updateCurrencyLabel() {
+    if (!currencySelect || !targetLabel) return;
+    var val = currencySelect.value;
+    if (val === 'USD') targetLabel.textContent = 'Preço-alvo (US$)';
+    else if (val === 'BRL') targetLabel.textContent = 'Preço-alvo (R$)';
+    else targetLabel.textContent = 'Preço-alvo (R$ / Livre)';
+  }
 
   function syncMonitorEmailRule() {
     if (!chkMonitorar || !inputEmail) return;
@@ -500,6 +826,8 @@
     }
   }
 
+  if (categorySelect) categorySelect.addEventListener('change', updateCategorySources);
+  if (currencySelect) currencySelect.addEventListener('change', updateCurrencyLabel);
   if (chkMonitorar) chkMonitorar.addEventListener('change', syncMonitorEmailRule);
 
   function showError(msg) {
@@ -529,34 +857,16 @@
     okBox.style.display = 'flex';
   }
 
-  function isValidEmail(email) {
-    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-  }
-
-  function qualifiesOffer(item, offer) {
-    if (Number(offer.price) <= 0) return false;
-    var filterCurr = item.currency_filter || 'ALL';
-    if (filterCurr !== 'ALL' && offer.currency !== filterCurr) return false;
-
-    var hasRule = item.target_price !== null || item.min_discount !== null;
-    if (!hasRule) return false;
-
-    var priceOk =
-      item.target_price !== null &&
-      (filterCurr === 'ALL' ? offer.currency === 'BRL' : offer.currency === filterCurr) &&
-      Number(offer.price) <= Number(item.target_price);
-    var discountOk = item.min_discount !== null && Number(offer.discount) >= Number(item.min_discount);
-    return priceOk || discountOk;
-  }
-
+  // --- Botão Pesquisa Rápida na Aba Monitoramentos ---
   var btnQuickCheck = document.getElementById('btn-quick-check');
   if (btnQuickCheck) {
     btnQuickCheck.addEventListener('click', async function () {
       showError('');
       var name = document.getElementById('item-name').value.trim();
+      var category = document.getElementById('item-category').value;
       var currFilter = document.getElementById('item-currency').value;
       var sources = Array.from(document.querySelectorAll('.src-chk:checked')).map(function (el) { return el.value; });
-      if (!name) return showError('Digite o nome do produto ou jogo para pesquisar.');
+      if (!name) return showError('Digite o nome do produto, software ou jogo para pesquisar.');
       if (!sources.length) return showError('Selecione pelo menos uma fonte.');
 
       var previewCard = document.getElementById('quick-search-card');
@@ -566,14 +876,18 @@
       btnQuickCheck.disabled = true;
 
       try {
-        var result = await executeRealSearch(name, sources, currFilter);
-        previewOut.innerHTML = renderOfferListHTML(result.offers, result.errors);
+        var result = await executeRealSearch(name, sources, currFilter, category);
+        previewOut.innerHTML = renderOfferListHTML(result.offers, result.errors, {
+          detected_category: result.detected_category,
+          usd_to_brl_rate: result.usd_to_brl_rate
+        });
       } finally {
         btnQuickCheck.disabled = false;
       }
     });
   }
 
+  // --- Salvar Novo Monitoramento (usa /api/scan quando ativo) ---
   var btnSaveItem = document.getElementById('btn-save-item');
   if (btnSaveItem) {
     btnSaveItem.addEventListener('click', async function () {
@@ -594,7 +908,7 @@
       var sources = Array.from(document.querySelectorAll('.src-chk:checked')).map(function (el) { return el.value; });
       var channels = Array.from(document.querySelectorAll('.chn-chk:checked')).map(function (el) { return el.value; });
 
-      if (!name) return showError('Informe o nome do produto ou jogo.');
+      if (!name) return showError('Informe o nome do produto, software ou jogo.');
       if (!sources.length) return showError('Selecione pelo menos uma fonte de busca.');
       if (!targetRaw && !discountRaw) return showError('Informe um preço-alvo ou um desconto mínimo (%).');
 
@@ -615,11 +929,12 @@
         target_price: targetRaw ? parseFloat(targetRaw) : null,
         min_discount: discountRaw ? parseFloat(discountRaw) : null,
         sources: sources,
-        channels: channels,
+        channels: channels.length ? channels : ['Painel'],
         destinations: { 'E-mail': email, Telegram: telegram, WhatsApp: whatsapp },
         frequency: frequency,
         active: wantsMonitor,
-        created_at: new Date().toISOString()
+        created_at: new Date().toISOString(),
+        last_checked: new Date().toISOString()
       };
 
       var items = getItems();
@@ -631,53 +946,44 @@
       document.getElementById('item-discount').value = '';
       renderMonitors();
 
-      showSuccess('Monitoramento de "' + name + '" salvo! Buscando ofertas atuais...');
+      showSuccess('Monitoramento de "' + name + '" salvo! Verificando ofertas atuais...');
 
       var previewCard = document.getElementById('quick-search-card');
       var previewOut = document.getElementById('quick-search-output');
       previewCard.style.display = 'block';
-      previewOut.innerHTML = '<p style="color:var(--muted);">Verificando ofertas em tempo real para "' + name + '"...</p>';
+      previewOut.innerHTML = '<p style="color:var(--muted);">Verificando ofertas em tempo real para "' + escapeHtml(name) + '"...</p>';
 
-      var searchRes = await executeRealSearch(name, sources, currency_filter);
-      previewOut.innerHTML = renderOfferListHTML(searchRes.offers, searchRes.errors);
-
-      if (wantsMonitor && searchRes.offers && searchRes.offers.length) {
-        var alerts = getAlerts();
-        var triggeredCount = 0;
-        searchRes.offers.forEach(function (off) {
-          if (qualifiesOffer(newItem, off)) {
-            alerts.push({
-              id: generateId(),
-              item_id: newItem.id,
-              name: off.name,
-              store: off.store,
-              delivery_type: off.delivery_type || detectDeliveryType(off.name, off.store),
-              currency: off.currency,
-              original_price: off.original_price,
-              price: off.price,
-              discount: off.discount,
-              url: off.url,
-              created_at: new Date().toISOString(),
-              notified: channels.join(', ')
+      btnSaveItem.disabled = true;
+      try {
+        if (wantsMonitor) {
+          var scanOut = await executeRealScan([newItem]);
+          var first = scanOut.results[0];
+          if (first) {
+            previewOut.innerHTML = renderOfferListHTML(first.offers, first.errors, {
+              detected_category: first.detected_category,
+              usd_to_brl_rate: first.usd_to_brl_rate
             });
-            triggeredCount++;
+            if (first.alerts && first.alerts.length) {
+              var allAlerts = getAlerts().concat(first.alerts);
+              saveAlerts(allAlerts);
+              renderAlerts();
+              showSuccess('Monitoramento salvo e ' + first.alerts.length + ' alerta(s) disparado(s)!');
+            }
           }
-        });
-        if (triggeredCount > 0) {
-          saveAlerts(alerts);
-          renderAlerts();
-          showSuccess('Monitoramento salvo e ' + triggeredCount + ' alerta(s) encontrado(s) imediatamente!');
+        } else {
+          var searchRes = await executeRealSearch(name, sources, currency_filter, category);
+          previewOut.innerHTML = renderOfferListHTML(searchRes.offers, searchRes.errors, {
+            detected_category: searchRes.detected_category,
+            usd_to_brl_rate: searchRes.usd_to_brl_rate
+          });
         }
+      } finally {
+        btnSaveItem.disabled = false;
       }
     });
   }
 
-  function formatCurrLabel(curr) {
-    if (curr === 'BRL') return 'Somente Real (R$)';
-    if (curr === 'USD') return 'Somente Dólar (US$)';
-    return 'Livre (BRL + USD)';
-  }
-
+  // --- Renderização dos Monitoramentos ---
   function renderMonitors() {
     var items = getItems();
     var container = document.getElementById('monitors-container');
@@ -691,28 +997,30 @@
     container.innerHTML = items.map(function (item) {
       var currFilter = item.currency_filter || 'ALL';
       var sym = currFilter === 'USD' ? 'US$ ' : 'R$ ';
+      var lastCheckedTxt = item.last_checked ? new Date(item.last_checked).toLocaleString('pt-BR') : 'Ainda não verificado';
       return (
-        '<div class="list-item" data-id="' + item.id + '">' +
+        '<div class="list-item" data-id="' + escapeHtml(item.id) + '">' +
           '<div>' +
-            '<div style="display:flex; align-items:center; gap:8px; margin-bottom:4px; flex-wrap:wrap;">' +
-              '<strong style="font-size:1rem;">' + item.name + '</strong>' +
-              '<span class="tag">' + item.category + '</span>' +
-              '<span class="tag">' + formatCurrLabel(currFilter) + '</span>' +
+            '<div style="display:flex; align-items:center; gap:6px; margin-bottom:4px; flex-wrap:wrap;">' +
+              '<strong style="font-size:1rem;">' + escapeHtml(item.name) + '</strong>' +
+              '<span class="tag">' + escapeHtml(item.category || 'Auto') + '</span>' +
+              '<span class="tag">' + escapeHtml(formatCurrLabel(currFilter)) + '</span>' +
               '<span class="tag ' + (item.active ? 'green' : 'paused') + '">' + (item.active ? 'Monitorando' : 'Pausado') + '</span>' +
             '</div>' +
             '<div style="font-size:0.83rem; color: var(--muted);">' +
-              'Alvo: <strong>' + (item.target_price ? sym + Number(item.target_price).toFixed(2) : 'Não definido') + '</strong> • ' +
-              'Desconto mín.: <strong>' + (item.min_discount ? item.min_discount + '%' : 'Não definido') + '</strong> • ' +
-              'Fontes: ' + item.sources.join(', ') +
+              'Alvo: <strong>' + (item.target_price ? escapeHtml(sym) + Number(item.target_price).toFixed(2) : 'Não definido') + '</strong> • ' +
+              'Desconto mín.: <strong>' + (item.min_discount ? escapeHtml(item.min_discount) + '%' : 'Não definido') + '</strong> • ' +
+              'Fontes: ' + escapeHtml((item.sources || []).join(', ')) +
             '</div>' +
             '<div style="font-size:0.8rem; color: var(--muted); margin-top:2px;">' +
-              'E-mail: <strong>' + ((item.destinations && item.destinations['E-mail']) || 'Não informado') + '</strong> • Frequência: ' + item.frequency +
+              'E-mail: <strong>' + escapeHtml((item.destinations && item.destinations['E-mail']) || 'Não informado') + '</strong> • ' +
+              'Frequência: ' + escapeHtml(item.frequency || 'A cada hora') + ' • Última checagem: ' + escapeHtml(lastCheckedTxt) +
             '</div>' +
           '</div>' +
-          '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
-            '<button class="btn btn-primary btn-sm js-check-one" data-id="' + item.id + '">Buscar ofertas</button>' +
-            '<button class="btn btn-outline btn-sm js-toggle-one" data-id="' + item.id + '">' + (item.active ? 'Pausar' : 'Ativar') + '</button>' +
-            '<button class="btn btn-danger js-delete-one" data-id="' + item.id + '">Excluir</button>' +
+          '<div class="action-row">' +
+            '<button type="button" class="btn btn-primary btn-sm js-check-one" data-id="' + escapeHtml(item.id) + '">Buscar ofertas</button>' +
+            '<button type="button" class="btn btn-outline btn-sm js-toggle-one" data-id="' + escapeHtml(item.id) + '">' + (item.active ? 'Pausar' : 'Ativar') + '</button>' +
+            '<button type="button" class="btn btn-danger js-delete-one" data-id="' + escapeHtml(item.id) + '">Excluir</button>' +
           '</div>' +
         '</div>'
       );
@@ -728,10 +1036,13 @@
         var previewCard = document.getElementById('quick-search-card');
         var previewOut = document.getElementById('quick-search-output');
         previewCard.style.display = 'block';
-        previewOut.innerHTML = '<p style="color:var(--muted);">Consultando ofertas para "' + item.name + '"...</p>';
+        previewOut.innerHTML = '<p style="color:var(--muted);">Consultando ofertas para "' + escapeHtml(item.name) + '"...</p>';
         try {
-          var res = await executeRealSearch(item.name, item.sources, item.currency_filter || 'ALL');
-          previewOut.innerHTML = renderOfferListHTML(res.offers, res.errors);
+          var res = await executeRealSearch(item.name, item.sources, item.currency_filter || 'ALL', item.category || 'Auto');
+          previewOut.innerHTML = renderOfferListHTML(res.offers, res.errors, {
+            detected_category: res.detected_category,
+            usd_to_brl_rate: res.usd_to_brl_rate
+          });
         } finally {
           btn.disabled = false;
           btn.textContent = 'Buscar ofertas';
@@ -742,8 +1053,8 @@
     container.querySelectorAll('.js-toggle-one').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var id = btn.getAttribute('data-id');
-        var items = getItems();
-        var item = items.find(function (i) { return i.id === id; });
+        var list = getItems();
+        var item = list.find(function (i) { return i.id === id; });
         if (!item) return;
         if (!item.active) {
           var email = (item.destinations && item.destinations['E-mail']) || '';
@@ -753,7 +1064,7 @@
           }
         }
         item.active = !item.active;
-        saveItems(items);
+        saveItems(list);
         renderMonitors();
       });
     });
@@ -761,19 +1072,59 @@
     container.querySelectorAll('.js-delete-one').forEach(function (btn) {
       btn.addEventListener('click', function () {
         var id = btn.getAttribute('data-id');
-        var items = getItems().filter(function (i) { return i.id !== id; });
-        saveItems(items);
+        var list = getItems().filter(function (i) { return i.id !== id; });
+        saveItems(list);
         renderMonitors();
       });
     });
   }
 
+  // --- Varredura de Todos os Monitoramentos Ativos via /api/scan ---
+  async function runScanForItems(targetItems, showPreview) {
+    if (!targetItems.length) return { offersCount: 0, alertsCount: 0 };
+
+    var scanOut = await executeRealScan(targetItems);
+    var allFoundOffers = [];
+    var allErrors = [];
+    var newAlerts = [];
+    var nowIso = new Date().toISOString();
+
+    scanOut.results.forEach(function (r) {
+      (r.offers || []).forEach(function (o) { allFoundOffers.push(o); });
+      (r.errors || []).forEach(function (e) { allErrors.push(r.item + ': ' + e); });
+      (r.alerts || []).forEach(function (a) { newAlerts.push(a); });
+    });
+
+    // Atualiza last_checked nos itens escaneados
+    var scannedIds = {};
+    targetItems.forEach(function (it) { scannedIds[it.id] = true; });
+    var updatedItems = getItems().map(function (it) {
+      return scannedIds[it.id] ? Object.assign({}, it, { last_checked: nowIso }) : it;
+    });
+    saveItems(updatedItems);
+    renderMonitors();
+
+    if (newAlerts.length > 0) {
+      saveAlerts(getAlerts().concat(newAlerts));
+      renderAlerts();
+    }
+
+    if (showPreview) {
+      var previewCard = document.getElementById('quick-search-card');
+      var previewOut = document.getElementById('quick-search-output');
+      previewCard.style.display = 'block';
+      previewOut.innerHTML = renderOfferListHTML(allFoundOffers, allErrors, {
+        usd_to_brl_rate: scanOut.results[0] && scanOut.results[0].usd_to_brl_rate
+      });
+    }
+
+    return { offersCount: allFoundOffers.length, alertsCount: newAlerts.length, viaServer: scanOut.viaServer };
+  }
+
   var btnScanNow = document.getElementById('btn-scan-now');
   if (btnScanNow) {
     btnScanNow.addEventListener('click', async function () {
-      var items = getItems();
-      var activeItems = items.filter(function (i) { return i.active; });
-
+      var activeItems = getItems().filter(function (i) { return i.active; });
       if (!activeItems.length) {
         alert('Cadastre pelo menos um monitoramento ativo antes de verificar.');
         return;
@@ -781,45 +1132,12 @@
 
       btnScanNow.disabled = true;
       btnScanNow.textContent = 'Verificando lojas...';
-
-      var allFoundOffers = [];
-      var newAlertsCount = 0;
-      var alerts = getAlerts();
-
       try {
-        for (var i = 0; i < activeItems.length; i++) {
-          var item = activeItems[i];
-          var res = await executeRealSearch(item.name, item.sources, item.currency_filter || 'ALL');
-          (res.offers || []).forEach(function (off) {
-            allFoundOffers.push(off);
-            if (qualifiesOffer(item, off)) {
-              alerts.push({
-                id: generateId(),
-                item_id: item.id,
-                name: off.name,
-                store: off.store,
-                delivery_type: off.delivery_type || detectDeliveryType(off.name, off.store),
-                currency: off.currency,
-                original_price: off.original_price,
-                price: off.price,
-                discount: off.discount,
-                url: off.url,
-                created_at: new Date().toISOString(),
-                notified: (item.channels || ['Painel']).join(', ')
-              });
-              newAlertsCount++;
-            }
-          });
-        }
-
-        saveAlerts(alerts);
-        renderAlerts();
-
-        var previewCard = document.getElementById('quick-search-card');
-        var previewOut = document.getElementById('quick-search-output');
-        previewCard.style.display = 'block';
-        previewOut.innerHTML = renderOfferListHTML(allFoundOffers, []);
-        showSuccess('Varredura concluída! ' + allFoundOffers.length + ' oferta(s) consultada(s) e ' + newAlertsCount + ' alerta(s) disparado(s).');
+        var summary = await runScanForItems(activeItems, true);
+        showSuccess(
+          'Varredura concluída' + (summary.viaServer ? ' via servidor' : ' localmente') + '! ' +
+          summary.offersCount + ' oferta(s) consultada(s) e ' + summary.alertsCount + ' novo(s) alerta(s) disparado(s).'
+        );
       } finally {
         btnScanNow.disabled = false;
         btnScanNow.textContent = 'Verificar todos agora';
@@ -827,34 +1145,92 @@
     });
   }
 
+  // --- Agendador Automático no Cliente (respeita frequency de cada item) ---
+  function frequencyToMs(freq) {
+    if (freq === 'A cada 15 min') return 15 * 60 * 1000;
+    if (freq === 'A cada 6 horas') return 6 * 60 * 60 * 1000;
+    if (freq === 'Uma vez por dia') return 24 * 60 * 60 * 1000;
+    return 60 * 60 * 1000; // A cada hora
+  }
+
+  function updateSchedulerBadge() {
+    var badge = document.getElementById('scheduler-status');
+    if (!badge) return;
+    var cfg = getConfig();
+    if (cfg.auto_scan === 'off') {
+      badge.textContent = 'Agendador pausado';
+      badge.className = 'tag paused';
+    } else {
+      badge.textContent = 'Agendador ativo';
+      badge.className = 'tag green';
+    }
+  }
+
+  async function runDueScheduledScans() {
+    var cfg = getConfig();
+    if (cfg.auto_scan === 'off' || isAutoScanning) return;
+    var now = Date.now();
+    var dueItems = getItems().filter(function (item) {
+      if (!item.active) return false;
+      var lastMs = item.last_checked ? Date.parse(item.last_checked) : 0;
+      return !lastMs || (now - lastMs) >= frequencyToMs(item.frequency);
+    });
+    if (!dueItems.length) return;
+
+    isAutoScanning = true;
+    try {
+      await runScanForItems(dueItems, false);
+    } catch (e) {
+    } finally {
+      isAutoScanning = false;
+    }
+  }
+
+  // --- Aba Pesquisar (Pesquisa Livre com Categoria) ---
   var btnRunSearch = document.getElementById('btn-run-search');
   var inputSearchTerm = document.getElementById('search-term');
+  var selectSearchCategory = document.getElementById('search-category');
   var selectSearchCurrency = document.getElementById('search-currency');
+
+  function updateSearchCategorySources() {
+    var cat = selectSearchCategory ? selectSearchCategory.value : 'Auto';
+    renderSourceChips('search-chips-container', cat, 'search-src-chk');
+  }
 
   async function triggerSearchTab() {
     var term = inputSearchTerm.value.trim();
+    var category = selectSearchCategory ? selectSearchCategory.value : 'Auto';
     var currFilter = selectSearchCurrency ? selectSearchCurrency.value : 'ALL';
     var sources = Array.from(document.querySelectorAll('.search-src-chk:checked')).map(function (el) { return el.value; });
     var out = document.getElementById('search-output');
 
     if (!term || !sources.length) {
-      out.innerHTML = '<p style="color:#fca5a5;">Digite o nome do jogo/produto e mantenha ao menos uma fonte selecionada.</p>';
+      out.innerHTML = '<p style="color:#fca5a5;">Digite o nome do produto/jogo e mantenha ao menos uma fonte selecionada.</p>';
       return;
     }
 
     btnRunSearch.disabled = true;
-    btnRunSearch.textContent = 'Buscando ofertas reais...';
-    out.innerHTML = '<p style="color:var(--muted);">Consultando APIs da Steam, CheapShark, GOG, Epic e lojas...</p>';
+    btnRunSearch.textContent = 'Buscando ofertas...';
+    out.innerHTML = '<p style="color:var(--muted);">Consultando fontes compatíveis para "' + escapeHtml(term) + '"...</p>';
 
     try {
-      var data = await executeRealSearch(term, sources, currFilter);
-      out.innerHTML = renderOfferListHTML(data.offers, data.errors);
+      var data = await executeRealSearch(term, sources, currFilter, category);
+      out.innerHTML = renderOfferListHTML(data.offers, data.errors, {
+        detected_category: data.detected_category,
+        usd_to_brl_rate: data.usd_to_brl_rate
+      });
     } finally {
       btnRunSearch.disabled = false;
       btnRunSearch.textContent = 'Buscar nas lojas';
     }
   }
 
+  if (selectSearchCategory) {
+    selectSearchCategory.addEventListener('change', function () {
+      updateSearchCategorySources();
+      if (inputSearchTerm && inputSearchTerm.value.trim()) triggerSearchTab();
+    });
+  }
   if (btnRunSearch) btnRunSearch.addEventListener('click', triggerSearchTab);
   if (inputSearchTerm) {
     inputSearchTerm.addEventListener('keydown', function (e) {
@@ -867,6 +1243,7 @@
     });
   }
 
+  // --- Aba Alertas ---
   function renderAlerts() {
     var alerts = getAlerts().slice().reverse();
     var badge = document.getElementById('alert-count-badge');
@@ -882,17 +1259,20 @@
     container.innerHTML = alerts.map(function (a) {
       var sym = formatCurrencySymbol(a.currency);
       var deliveryBadge = formatDeliveryBadge(a.delivery_type || detectDeliveryType(a.name, a.store));
+      var linkUrl = safeUrl(a.url);
       return (
         '<div class="list-item">' +
           '<div>' +
-            '<strong>' + a.name + '</strong> ' +
+            '<strong>' + escapeHtml(a.name) + '</strong> ' +
             deliveryBadge +
-            '<span class="tag green" style="margin-left:4px;">' + sym + ' ' + Number(a.price).toFixed(2) + ' (-' + Math.round(a.discount) + '%)</span>' +
+            '<span class="tag green">' + escapeHtml(sym) + ' ' + Number(a.price).toFixed(2) + ' (-' + Math.round(Number(a.discount || 0)) + '%)</span>' +
             '<div style="font-size:0.82rem; color:var(--muted); margin-top:4px;">' +
-              'Loja: ' + a.store + ' • Moeda: ' + a.currency + ' • Via: ' + (a.notified || 'Painel') + ' • ' + new Date(a.created_at).toLocaleString('pt-BR') +
+              'Loja: ' + escapeHtml(a.store) + ' • Moeda: ' + escapeHtml(a.currency) +
+              ' • Via: ' + escapeHtml(a.notified || 'Painel') +
+              ' • ' + escapeHtml(new Date(a.created_at).toLocaleString('pt-BR')) +
             '</div>' +
           '</div>' +
-          '<a href="' + a.url + '" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm" style="text-decoration:none;">Ver oferta</a>' +
+          '<a href="' + escapeHtml(linkUrl) + '" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">Ver oferta ↗</a>' +
         '</div>'
       );
     }).join('');
@@ -912,60 +1292,78 @@
       var alerts = getAlerts();
       if (!alerts.length) return alert('Não há alertas para exportar.');
 
-      var header = ['data', 'item', 'tipo_entrega', 'loja', 'moeda', 'preco_original', 'preco', 'desconto_pct', 'url'];
+      var header = ['data', 'item', 'tipo_entrega', 'loja', 'moeda', 'preco_original', 'preco', 'desconto_pct', 'notificado_via', 'url'];
       var rows = alerts.map(function (a) {
         return [
-          a.created_at,
-          '"' + String(a.name || '').split('"').join('""') + '"',
-          a.delivery_type || detectDeliveryType(a.name, a.store),
-          a.store,
-          a.currency,
-          a.original_price,
-          a.price,
-          a.discount,
-          a.url
+          sanitizeCsvCell(a.created_at),
+          sanitizeCsvCell(a.name),
+          sanitizeCsvCell(a.delivery_type || detectDeliveryType(a.name, a.store)),
+          sanitizeCsvCell(a.store),
+          sanitizeCsvCell(a.currency),
+          Number(a.original_price || 0).toFixed(2),
+          Number(a.price || 0).toFixed(2),
+          Math.round(Number(a.discount || 0)),
+          sanitizeCsvCell(a.notified || 'Painel'),
+          sanitizeCsvCell(safeUrl(a.url))
         ].join(';');
       });
 
       var blob = new Blob(['\ufeff' + [header.join(';')].concat(rows).join('\n')], { type: 'text/csv;charset=utf-8;' });
+      var blobUrl = URL.createObjectURL(blob);
       var link = document.createElement('a');
-      link.href = URL.createObjectURL(blob);
+      link.href = blobUrl;
       link.download = 'alertas_monitordepromocoes.csv';
       link.click();
+      setTimeout(function () { URL.revokeObjectURL(blobUrl); }, 2000);
     });
   }
 
+  // --- Aba Configurações ---
   function loadSavedConfig() {
-    var cfg = JSON.parse(localStorage.getItem(STORAGE_CFG_KEY) || '{}');
+    var cfg = getConfig();
     if (cfg.default_email) {
       var el = document.getElementById('cfg-email-default');
       if (el) el.value = cfg.default_email;
       if (inputEmail && !inputEmail.value) inputEmail.value = cfg.default_email;
     }
-    if (cfg.telegram_bot_token) document.getElementById('cfg-telegram-token').value = cfg.telegram_bot_token;
-    if (cfg.telegram_chat_id) document.getElementById('cfg-telegram-chat').value = cfg.telegram_chat_id;
-    if (cfg.rss_feeds && cfg.rss_feeds[0] && cfg.rss_feeds[0].url) {
-      document.getElementById('cfg-rss-url').value = cfg.rss_feeds[0].url;
+    var tgChat = document.getElementById('cfg-telegram-chat');
+    if (tgChat && cfg.telegram_chat_id) tgChat.value = cfg.telegram_chat_id;
+
+    var rssEl = document.getElementById('cfg-rss-url');
+    if (rssEl && cfg.rss_feeds && cfg.rss_feeds[0] && cfg.rss_feeds[0].url) {
+      rssEl.value = cfg.rss_feeds[0].url;
     }
+
+    var autoEl = document.getElementById('cfg-auto-scan');
+    if (autoEl && cfg.auto_scan) {
+      autoEl.value = cfg.auto_scan;
+    }
+    updateSchedulerBadge();
   }
 
   var btnSaveConfig = document.getElementById('btn-save-config');
   if (btnSaveConfig) {
     btnSaveConfig.addEventListener('click', function () {
       var default_email = document.getElementById('cfg-email-default').value.trim();
-      var telegram_bot_token = document.getElementById('cfg-telegram-token').value.trim();
       var telegram_chat_id = document.getElementById('cfg-telegram-chat').value.trim();
       var rssUrl = document.getElementById('cfg-rss-url').value.trim();
+      var auto_scan = document.getElementById('cfg-auto-scan').value;
+
+      if (rssUrl && safeUrl(rssUrl) === '#') {
+        alert('Informe uma URL de Feed RSS válida começando com https:// ou http://.');
+        return;
+      }
 
       var cfg = {
         default_email: default_email,
-        telegram_bot_token: telegram_bot_token,
         telegram_chat_id: telegram_chat_id,
-        rss_feeds: rssUrl ? [{ name: 'Promobit (RSS)', url: rssUrl }] : []
+        rss_feeds: rssUrl ? [{ name: 'Feed RSS Personalizado', url: rssUrl }] : [],
+        auto_scan: auto_scan
       };
 
       localStorage.setItem(STORAGE_CFG_KEY, JSON.stringify(cfg));
       if (default_email && inputEmail && !inputEmail.value) inputEmail.value = default_email;
+      updateSchedulerBadge();
       alert('Configurações salvas com sucesso!');
     });
   }
@@ -976,12 +1374,16 @@
     });
   }
 
+  // Inicialização
   updateCategorySources();
   updateCurrencyLabel();
-  renderSourceChips('search-chips-container', 'Jogos', 'search-src-chk');
+  updateSearchCategorySources();
   syncMonitorEmailRule();
   loadSavedConfig();
   checkServerHealth();
   renderMonitors();
   renderAlerts();
+
+  // Verifica periodicamente (a cada 60s) se algum monitoramento ativo atingiu o intervalo configurado
+  setInterval(runDueScheduledScans, 60 * 1000);
 })();

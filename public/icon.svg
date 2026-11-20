@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Monitor de Promoções">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#1e293b" />
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#2dd4bf" />
+      <stop offset="100%" stop-color="#10b981" />
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)" />
+  <circle cx="256" cy="256" r="176" fill="none" stroke="url(#accent)" stroke-width="18" opacity="0.25" />
+  <path d="M168 256l64-112h128l-20 128-96 96-76-76a32 32 0 0 1 0-36z" fill="url(#accent)" />
+  <circle cx="308" cy="198" r="20" fill="#0f172a" />
+  <path d="M180 344l60-60" stroke="#0f172a" stroke-width="18" stroke-linecap="round" />
+</svg>

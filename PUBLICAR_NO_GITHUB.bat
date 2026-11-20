@@ -17,30 +17,24 @@ if errorlevel 1 (
 )
 
 if not exist ".git" (
-    echo [1/5] Inicializando repositorio Git local...
+    echo [1/4] Inicializando repositorio Git local...
     git init
+    git branch -M main
+    git remote add origin https://github.com/maicomthiago-lang/MonitordePromocoes.git
 )
 
-echo [2/5] Configurando branch principal (main)...
-git branch -M main
+set /p COMMIT_MSG=Digite a mensagem do commit (Enter para padrao): 
+if "%COMMIT_MSG%"=="" set COMMIT_MSG=chore: atualizacao do Monitor de Promocoes 5.1
 
-echo [3/5] Conectando ao repositorio remoto...
-git remote remove origin >nul 2>&1
-git remote add origin https://github.com/maicomthiago-lang/MonitordePromocoes.git
+echo [2/4] Verificando arquivos modificados...
+git status -s
 
-echo [4/5] Adicionando arquivos e criando commit...
+echo [3/4] Adicionando arquivos (respeitando .gitignore) e criando commit...
 git add .
-git commit -m "chore: renomeia projeto para monitordepromocoes (padrao Vercel e Git)"
+git commit -m "%COMMIT_MSG%"
 
-echo [5/5] Enviando arquivos para o GitHub...
-git push -u origin main --force
-
-if errorlevel 1 (
-    echo.
-    echo [AVISO] Caso seu repositorio no GitHub ainda se chame Monitor_de_Promocoes, tentando enviar para ele tambem...
-    git remote set-url origin https://github.com/maicomthiago-lang/MonitordePromocoes.git
-    git push -u origin main --force
-)
+echo [4/4] Enviando para o GitHub (push seguro sem --force)...
+git push -u origin main
 
 echo.
 echo ========================================================

@@ -1,20 +1,24 @@
 {
   "name": "monitordepromocoes",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node dev-server.mjs",
-    "dev": "node dev-server.mjs",
-    "typecheck": "tsc --noEmit"
+    "build": "tsc",
+    "start": "npm run build && node dev-server.mjs",
+    "dev": "npm run build && node dev-server.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test dist/tests/*.test.js"
   },
   "dependencies": {
-    "@vercel/node": "^5.0.0",
-    "nodemailer": "^6.9.16"
+    "fast-xml-parser": "^5.12.1",
+    "nodemailer": "^10.6.0",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
-    "typescript": "^5.7.2",
     "@types/node": "^22.10.0",
-    "@types/nodemailer": "^6.4.17"
+    "@types/nodemailer": "^6.4.17",
+    "@vercel/node": "^32.0.0",
+    "typescript": "^5.7.2"
   }
 }
