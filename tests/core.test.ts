@@ -259,6 +259,8 @@ test('qualifies() suporta BRL, USD e ALL com conversão cambial + dedup determin
 
   assert.equal(searchRequestSchema.safeParse({ term: '', sources: ['Steam'] }).success, false);
   assert.equal(searchRequestSchema.safeParse({ term: 'windows 11', sources: ['Google Shopping'] }).success, true);
+  assert.equal(searchRequestSchema.safeParse({ term: 'windows 11', sources: [] }).success, true);
+  assert.equal(searchRequestSchema.safeParse({ term: 'windows 11' }).success, true);
   assert.equal(scanRequestSchema.safeParse({ items: Array(21).fill(baseItem) }).success, false);
 });
 
@@ -301,7 +303,7 @@ test('Cupons: mantém somente códigos ativos, da mesma loja e com links HTTP se
 test('searchSources em modo Auto para "windows 11" detecta Software e remove lojas exclusivas de jogos', async () => {
   const res = await searchSources(
     'windows 11',
-    ['Steam', 'GOG', 'Epic Games', 'Nuuvem', 'CheapShark (USD)', 'Google Shopping', 'Amazon'],
+    [],
     [],
     'ALL',
     'Auto'
