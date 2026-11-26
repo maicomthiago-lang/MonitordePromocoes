@@ -276,6 +276,12 @@ input.input-error {
   align-items: center;
 }
 
+.source-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 10px;
+}
+
 .source-chip {
   display: inline-flex;
   align-items: center;

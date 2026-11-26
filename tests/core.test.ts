@@ -12,7 +12,7 @@ import {
   normalizeForSearch,
   scoreOfferRelevance
 } from '../lib/relevance.js';
-import { filterActiveStoreCoupons, normalizeOfferPricing, parseRssXmlOffers, qualifies, searchSources } from '../lib/search.js';
+import { filterActiveStoreCoupons, filterCouponsForProduct, normalizeOfferPricing, parseRssXmlOffers, qualifies, searchSources } from '../lib/search.js';
 import {
   buildAlertDedupKey,
   checkRateLimit,
@@ -265,7 +265,7 @@ test('qualifies() suporta BRL, USD e ALL com conversão cambial + dedup determin
 test('Cupons: mantém somente códigos ativos, da mesma loja e com links HTTP seguros', () => {
   const coupons = filterActiveStoreCoupons([
     {
-      code: 'AMAZON10', title: '10% de desconto', store_name: 'Amazon',
+      code: 'AMAZON10', title: '10% na primeira compra', store_name: 'Amazon',
       expires_at: '2026-11-27T03:00:00.000Z', url: 'https://cupomdescontos.com/ir/amazon',
       source_url: 'https://cupomdescontos.com/cupom/amazon'
     },
@@ -287,6 +287,14 @@ test('Cupons: mantém somente códigos ativos, da mesma loja e com links HTTP se
   assert.equal(coupons.length, 1);
   assert.equal(coupons[0]?.code, 'AMAZON10');
   assert.equal(coupons[0]?.status, 'Vigente na fonte; checkout não testado');
+
+  const productCoupons = filterCouponsForProduct([
+    ...coupons,
+    { ...coupons[0]!, code: 'JOGOS10', title: '10% de desconto em jogos' },
+    { ...coupons[0]!, code: 'TV10', title: '10% em televisores selecionados' },
+    { ...coupons[0]!, code: 'SEMJOGOS', title: '10% em todos os produtos, exceto jogos' }
+  ], 'Hades', 'Jogos');
+  assert.deepEqual(productCoupons.map((coupon) => coupon.code), ['AMAZON10', 'JOGOS10']);
 });
 
 // --- 6. Pesquisa Livre ("windows 11") em modo Auto não retorna lojas de jogos ---

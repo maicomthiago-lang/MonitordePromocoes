@@ -297,15 +297,16 @@
     '33': 'DLGamer', '34': 'Noctre', '35': 'DreamGame'
   };
 
-  function renderSourceChips(containerId, category, inputClass) {
+  function renderSourceChips(containerId, category, inputClass, allUnchecked, bulkButtonId) {
     var container = document.getElementById(containerId);
     if (!container) return;
     var list = SOURCES_BY_CATEGORY[category] || SOURCES_BY_CATEGORY.Outros;
     container.innerHTML = list.map(function (src) {
       var safeName = escapeHtml(src.name);
+      var checked = !allUnchecked && src.defaultChecked;
       return (
-        '<label class="source-chip ' + (src.defaultChecked ? 'selected' : '') + '">' +
-          '<input type="checkbox" class="' + escapeHtml(inputClass) + '" value="' + safeName + '" ' + (src.defaultChecked ? 'checked' : '') + ' />' +
+        '<label class="source-chip ' + (checked ? 'selected' : '') + '">' +
+          '<input type="checkbox" class="' + escapeHtml(inputClass) + '" value="' + safeName + '" ' + (checked ? 'checked' : '') + ' />' +
           '<span>' + safeName + '</span>' +
         '</label>'
       );
@@ -317,9 +318,39 @@
       if (!chk) return;
       chk.addEventListener('change', function () {
         chip.classList.toggle('selected', chk.checked);
+        updateBulkSourceButton(bulkButtonId, inputClass);
       });
     });
+    updateBulkSourceButton(bulkButtonId, inputClass);
   }
+
+  function updateBulkSourceButton(buttonId, inputClass) {
+    var button = document.getElementById(buttonId);
+    if (!button) return;
+    var checkboxes = Array.from(document.querySelectorAll('#' + (inputClass === 'src-chk' ? 'sources-chips-container' : 'search-chips-container') + ' .' + inputClass));
+    button.textContent = checkboxes.length && checkboxes.every(function (input) { return input.checked; })
+      ? 'Desmarcar todas'
+      : 'Marcar todas';
+  }
+
+  function toggleAllSources(containerId, buttonId, inputClass) {
+    var container = document.getElementById(containerId);
+    if (!container) return;
+    var checkboxes = Array.from(container.querySelectorAll('.' + inputClass));
+    var shouldCheck = !checkboxes.length || !checkboxes.every(function (input) { return input.checked; });
+    checkboxes.forEach(function (input) {
+      input.checked = shouldCheck;
+      input.closest('.source-chip').classList.toggle('selected', shouldCheck);
+    });
+    updateBulkSourceButton(buttonId, inputClass);
+  }
+
+  document.getElementById('btn-toggle-all-monitor-sources').addEventListener('click', function () {
+    toggleAllSources('sources-chips-container', 'btn-toggle-all-monitor-sources', 'src-chk');
+  });
+  document.getElementById('btn-toggle-all-search-sources').addEventListener('click', function () {
+    toggleAllSources('search-chips-container', 'btn-toggle-all-search-sources', 'search-src-chk');
+  });
 
   // --- Navegação por Abas ---
   var tabButtons = document.querySelectorAll('.nav-tab');
@@ -874,7 +905,7 @@
     if (!categorySelect || !sourcesLegend) return;
     var cat = categorySelect.value;
     sourcesLegend.textContent = 'Fontes (' + cat + ')';
-    renderSourceChips('sources-chips-container', cat, 'src-chk');
+    renderSourceChips('sources-chips-container', cat, 'src-chk', true, 'btn-toggle-all-monitor-sources');
   }
 
   function updateCurrencyLabel() {
@@ -1327,7 +1358,7 @@
 
   function updateSearchCategorySources() {
     var cat = selectSearchCategory ? selectSearchCategory.value : 'Auto';
-    renderSourceChips('search-chips-container', cat, 'search-src-chk');
+    renderSourceChips('search-chips-container', cat, 'search-src-chk', true, 'btn-toggle-all-search-sources');
   }
 
   async function triggerSearchTab() {
@@ -1338,7 +1369,7 @@
     var out = document.getElementById('search-output');
 
     if (!term || !sources.length) {
-      out.innerHTML = '<p style="color:#fca5a5;">Digite o nome do produto/jogo e mantenha ao menos uma fonte selecionada.</p>';
+      out.innerHTML = '<p style="color:#fca5a5;">Digite o produto e selecione ao menos uma fonte. Use “Marcar todas” para consultar todas as lojas.</p>';
       return;
     }
 
