@@ -5,13 +5,14 @@ import test from 'node:test';
 import { pathToFileURL } from 'node:url';
 
 import { detectDeliveryType } from '../lib/classifier.js';
+import { formatNotificationMessage } from '../lib/notifications.js';
 import {
   detectQueryCategory,
   matchesSearchTerm,
   normalizeForSearch,
   scoreOfferRelevance
 } from '../lib/relevance.js';
-import { parseRssXmlOffers, qualifies, searchSources } from '../lib/search.js';
+import { filterActiveStoreCoupons, normalizeOfferPricing, parseRssXmlOffers, qualifies, searchSources } from '../lib/search.js';
 import {
   buildAlertDedupKey,
   checkRateLimit,
@@ -150,9 +151,62 @@ test('Parser RSS/Atom com fast-xml-parser extrai preços BRL e USD e aplica filt
   assert.equal(offers.length, 2);
   assert.equal(offers[0]?.currency, 'BRL');
   assert.equal(offers[0]?.price, 89.9);
+  assert.equal(offers[0]?.original_price, 89.9);
+  assert.equal(offers[0]?.discount, 0);
   assert.equal(offers[0]?.delivery_type, 'Chave (Key)');
   assert.equal(offers[1]?.currency, 'USD');
   assert.equal(offers[1]?.price, 19.99);
+
+  const promoRss = `<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title>Windows 11 Pro Original</title>
+        <link>https://loja.exemplo.com/win11-promo</link>
+        <description>De R$ 200,00 por R$ 100,00</description>
+      </item>
+      <item>
+        <title>Windows 11 Home Key -50% OFF</title>
+        <link>https://keys.exemplo.com/win11-home</link>
+        <description>Oferta por US$ 20.00</description>
+      </item>
+    </channel></rss>`;
+
+  const promoOffers = parseRssXmlOffers(promoRss, 'windows 11', 'Feed Promo');
+  assert.equal(promoOffers.length, 2);
+  assert.equal(promoOffers[0]?.original_price, 200);
+  assert.equal(promoOffers[0]?.price, 100);
+  assert.equal(promoOffers[0]?.discount, 50);
+  assert.equal(promoOffers[1]?.original_price, 40);
+  assert.equal(promoOffers[1]?.price, 20);
+  assert.equal(promoOffers[1]?.discount, 50);
+});
+
+test('Preservação de valor original, valor encontrado e desconto aplicado em ofertas e notificações', () => {
+  const normalized = normalizeOfferPricing(
+    {
+      name: 'Cyberpunk 2077',
+      store: 'GOG',
+      kind: 'Loja oficial',
+      delivery_type: 'Ativação Direta (Conta)',
+      currency: 'USD',
+      original_price: 59.99,
+      price: 29.99,
+      discount: 0,
+      url: 'https://www.gog.com/en/game/cyberpunk_2077'
+    },
+    5.5
+  );
+
+  assert.equal(normalized.original_price, 59.99);
+  assert.equal(normalized.price, 29.99);
+  assert.equal(normalized.discount, 50);
+  assert.equal(normalized.original_price_brl_estimated, 329.95);
+  assert.equal(normalized.price_brl_estimated, 164.95);
+
+  const msg = formatNotificationMessage(normalized);
+  assert.ok(msg.includes('Valor original: US$ 59.99 (~R$ 329.95)'));
+  assert.ok(msg.includes('Valor encontrado: US$ 29.99 (~R$ 164.95)'));
+  assert.ok(msg.includes('Desconto aplicado: 50%'));
 });
 
 // --- 4. Classificação Chave vs Ativação Direta vs Conta ---
@@ -208,6 +262,33 @@ test('qualifies() suporta BRL, USD e ALL com conversão cambial + dedup determin
   assert.equal(scanRequestSchema.safeParse({ items: Array(21).fill(baseItem) }).success, false);
 });
 
+test('Cupons: mantém somente códigos ativos, da mesma loja e com links HTTP seguros', () => {
+  const coupons = filterActiveStoreCoupons([
+    {
+      code: 'AMAZON10', title: '10% de desconto', store_name: 'Amazon',
+      expires_at: '2026-11-27T03:00:00.000Z', url: 'https://cupomdescontos.com/ir/amazon',
+      source_url: 'https://cupomdescontos.com/cupom/amazon'
+    },
+    {
+      code: 'VENCIDO', title: 'Cupom expirado', store_name: 'Amazon',
+      expires_at: '2026-11-24T03:00:00.000Z', url: 'https://cupomdescontos.com/ir/amazon',
+      source_url: 'https://cupomdescontos.com/cupom/amazon'
+    },
+    {
+      code: 'OUTRA-LOJA', title: 'Outro cupom', store_name: 'Magalu',
+      url: 'https://cupomdescontos.com/ir/magalu', source_url: 'https://cupomdescontos.com/cupom/magalu'
+    },
+    {
+      code: 'URL-INVÁLIDA', title: 'Link inseguro', store_name: 'Amazon',
+      url: 'javascript:alert(1)', source_url: 'https://cupomdescontos.com/cupom/amazon'
+    }
+  ], 'Amazon', Date.parse('2026-11-25T12:00:00.000Z'));
+
+  assert.equal(coupons.length, 1);
+  assert.equal(coupons[0]?.code, 'AMAZON10');
+  assert.equal(coupons[0]?.status, 'Vigente na fonte; checkout não testado');
+});
+
 // --- 6. Pesquisa Livre ("windows 11") em modo Auto não retorna lojas de jogos ---
 test('searchSources em modo Auto para "windows 11" detecta Software e remove lojas exclusivas de jogos', async () => {
   const res = await searchSources(
@@ -219,14 +300,10 @@ test('searchSources em modo Auto para "windows 11" detecta Software e remove loj
   );
 
   assert.equal(res.detected_category, 'Software');
-  const stores = res.offers.map((o) => o.store);
-  assert.equal(stores.includes('Steam'), false);
-  assert.equal(stores.includes('GOG'), false);
-  assert.equal(stores.includes('Epic Games'), false);
-  assert.equal(stores.includes('Nuuvem'), false);
-  assert.ok(stores.includes('Google Shopping'));
-  assert.ok(stores.includes('Mercado Livre'));
-  assert.ok(stores.includes('Amazon'));
+  assert.equal(res.offers.some((o) => ['Steam', 'GOG', 'Epic Games', 'Nuuvem'].includes(o.store)), false);
+  assert.equal(res.offers.every((offer) => offer.price > 0), true);
+  assert.equal(res.offers.every((offer) => matchesSearchTerm(offer.name, 'windows 11')), true);
+  assert.equal(res.offers.every((offer) => cleanHttpUrl(offer.url) !== ''), true);
 });
 
 // --- 7. Teste HTTP End-to-End no dev-server.mjs ---

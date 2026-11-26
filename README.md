@@ -6,6 +6,7 @@ Rastreador de promoções e ofertas em Real (`BRL`) e Dólar (`USD`) com filtro 
 - **Pesquisa Livre Inteligente (`Auto`):** detecta automaticamente se o termo é **Software** (ex.: `Windows 11`, `Office 365`), **Hardware** (`RTX 4070`, `SSD NVMe`), **Eletrônicos** ou **Jogos**, filtrando falsos positivos (ex.: jogos `"for Windows 11"`) e priorizando fontes relevantes.
 - **Moedas `BRL` / `USD` com conversão em tempo real:** consulta cotação USD → BRL para exibir valor estimado em Reais e comparar preços-alvo mesmo no modo `Livre`.
 - **Classificação de Entrega:** distingue `🔑 Chave (Key)`, `⚡ Ativação Direta (Conta)` e `👤 Conta`.
+- **Cupons por loja:** após a pesquisa, consulta cupons ativos da loja encontrada, exibe o código, validade e condições ao lado da oferta e permite copiar o código. A fonte informa que os cupons do feed não são testados no checkout; o app identifica isso claramente.
 - **Segurança Hardened:** prevenção de XSS no frontend, CSP estrito (`script-src 'self'`), proteção SSRF em feeds RSS/Atom (via `fast-xml-parser` com `processEntities: false`), validação de payloads com `zod`, rate limiting, proteção contra CSV Formula Injection e proteção contra Path Traversal.
 - **Arquitetura Unificada:** backend modular em `lib/` compartilhado entre Vercel (`api/index.ts`) e servidor local (`dev-server.mjs`), com frontend único em `public/`.
 

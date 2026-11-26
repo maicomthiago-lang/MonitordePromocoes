@@ -11,6 +11,39 @@ function allowClientOverrides(): boolean {
   return process.env.ALLOW_CLIENT_RUNTIME_CONFIG === 'true';
 }
 
+export function formatNotificationMessage(offer: Offer): string {
+  const sym = offer.currency === 'USD' ? 'US$' : 'R$';
+  const foundPrice = Number(offer.price || 0);
+  const originalPrice =
+    Number(offer.original_price) > 0 ? Number(offer.original_price) : foundPrice;
+  const discountPct =
+    Number(offer.discount) > 0
+      ? Math.round(Number(offer.discount))
+      : originalPrice > foundPrice && originalPrice > 0
+        ? Math.round(((originalPrice - foundPrice) / originalPrice) * 100)
+        : 0;
+
+  const originalLine =
+    offer.currency === 'USD' && offer.original_price_brl_estimated
+      ? `Valor original: ${sym} ${originalPrice.toFixed(2)} (~R$ ${offer.original_price_brl_estimated.toFixed(2)})`
+      : `Valor original: ${sym} ${originalPrice.toFixed(2)}`;
+
+  const priceLine =
+    offer.currency === 'USD' && offer.price_brl_estimated
+      ? `Valor encontrado: ${sym} ${foundPrice.toFixed(2)} (~R$ ${offer.price_brl_estimated.toFixed(2)})`
+      : `Valor encontrado: ${sym} ${foundPrice.toFixed(2)}`;
+
+  return [
+    `Promoção encontrada: ${offer.name}`,
+    `Tipo de entrega: ${offer.delivery_type}`,
+    `Loja: ${offer.store}`,
+    originalLine,
+    priceLine,
+    `Desconto aplicado: ${discountPct}%`,
+    `Link: ${offer.url}`
+  ].join('\n');
+}
+
 export async function sendNotifications(
   item: MonitorItem,
   offer: Offer,
@@ -20,19 +53,7 @@ export async function sendNotifications(
   const errors: string[] = [];
   const canOverride = allowClientOverrides();
 
-  const priceLine =
-    offer.currency === 'USD' && offer.price_brl_estimated
-      ? `Preço: US$ ${offer.price.toFixed(2)} (~R$ ${offer.price_brl_estimated.toFixed(2)})`
-      : `Preço: ${offer.currency === 'USD' ? 'US$' : 'R$'} ${offer.price.toFixed(2)}`;
-
-  const message = [
-    `Promoção encontrada: ${offer.name}`,
-    `Tipo de entrega: ${offer.delivery_type}`,
-    `Loja: ${offer.store}`,
-    priceLine,
-    `Desconto: ${Math.round(offer.discount)}%`,
-    `Link: ${offer.url}`
-  ].join('\n');
+  const message = formatNotificationMessage(offer);
 
   // 1. E-mail via SMTP (nodemailer)
   const emailTo = (item.destinations?.['E-mail'] || item.destinations?.email || '').trim();

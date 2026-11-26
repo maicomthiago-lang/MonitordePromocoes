@@ -640,18 +640,65 @@
     return priceOk || discountOk;
   }
 
+  function normalizePricing(o) {
+    var price = Number(o && o.price) > 0 ? Number(o.price) : 0;
+    if (price <= 0) {
+      return { price: 0, original_price: 0, discount: 0 };
+    }
+    var orig = Number(o && o.original_price) > 0 ? Number(o.original_price) : price;
+    var disc = Number(o && o.discount) > 0 ? Math.min(100, Math.round(Number(o.discount))) : 0;
+
+    if (orig < price) orig = price;
+    if (orig > price) {
+      disc = Math.max(0, Math.min(100, Math.round(((orig - price) / orig) * 100)));
+    } else if (disc > 0 && disc < 100) {
+      orig = Number((price / (1 - disc / 100)).toFixed(2));
+    } else {
+      disc = 0;
+    }
+
+    return { price: price, original_price: orig, discount: disc };
+  }
+
+  function renderPriceBreakdown(o) {
+    var p = normalizePricing(o);
+    if (p.price <= 0) {
+      return '<span class="tag">Busca direta (' + escapeHtml(o.currency || 'BRL') + ')</span>';
+    }
+
+    var sym = formatCurrencySymbol(o.currency);
+    var hasDiscount = p.discount > 0 && p.original_price > p.price;
+    var origClass = hasDiscount ? 'price-old discounted' : 'price-old';
+    var discClass = p.discount > 0 ? 'tag green' : 'tag paused';
+    var discLabel = p.discount > 0 ? '-' + p.discount + '%' : '0%';
+    var estHtml = (o.currency === 'USD' && o.price_brl_estimated)
+      ? '<span class="price-est">(≈ R$ ' + Number(o.price_brl_estimated).toFixed(2) + ')</span>'
+      : '';
+
+    return (
+      '<div class="price-breakdown">' +
+        '<span class="price-cell">' +
+          '<span class="price-label">Original:</span>' +
+          '<span class="' + origClass + '">' + escapeHtml(sym) + ' ' + p.original_price.toFixed(2) + '</span>' +
+        '</span>' +
+        '<span class="price-cell">' +
+          '<span class="price-label">Encontrado:</span>' +
+          '<span class="price-highlight">' + escapeHtml(sym) + ' ' + p.price.toFixed(2) + '</span>' +
+          estHtml +
+        '</span>' +
+        '<span class="price-cell">' +
+          '<span class="price-label">Desconto:</span>' +
+          '<span class="' + discClass + '" style="margin:0;">' + escapeHtml(discLabel) + '</span>' +
+        '</span>' +
+      '</div>'
+    );
+  }
+
   // --- Renderização segura de ofertas (separa preços reais vs links de busca) ---
   function renderSingleOfferCard(o) {
     var hasPrice = Number(o.price) > 0;
-    var sym = formatCurrencySymbol(o.currency);
     var deliveryBadge = formatDeliveryBadge(o.delivery_type || detectDeliveryType(o.name, o.store));
-
-    var priceHtml = hasPrice
-      ? '<span class="price-highlight">' + escapeHtml(sym) + ' ' + Number(o.price).toFixed(2) + ' (' + escapeHtml(o.currency) + ')</span>' +
-        (o.currency === 'USD' && o.price_brl_estimated ? '<span class="price-est">≈ R$ ' + Number(o.price_brl_estimated).toFixed(2) + '</span>' : '') +
-        (Number(o.original_price) > Number(o.price) ? '<s class="price-old">' + escapeHtml(sym) + ' ' + Number(o.original_price).toFixed(2) + '</s>' : '') +
-        (Number(o.discount) > 0 ? '<span class="tag green">-' + Math.round(Number(o.discount)) + '%</span>' : '')
-      : '<span class="tag">Busca direta (' + escapeHtml(o.currency) + ')</span>';
+    var priceHtml = renderPriceBreakdown(o);
 
     var safeThumb = o.thumb ? safeUrl(o.thumb) : '#';
     var thumbHtml = safeThumb !== '#'
@@ -659,6 +706,27 @@
       : '';
 
     var linkUrl = safeUrl(o.url);
+    var couponsHtml = (o.coupons || []).map(function (coupon) {
+      var couponLink = safeUrl(coupon.url);
+      var sourceLink = safeUrl(coupon.source_url);
+      var discount = coupon.discount_percent
+        ? '<span class="tag green">-' + escapeHtml(coupon.discount_percent) + '%</span>'
+        : (coupon.discount_fixed ? '<span class="tag green">R$ ' + escapeHtml(Number(coupon.discount_fixed).toFixed(2)) + ' off</span>' : '');
+      var expiry = coupon.expires_at_brt
+        ? '<div class="coupon-meta">Validade informada: ' + escapeHtml(coupon.expires_at_brt) + '</div>'
+        : '';
+      var conditions = coupon.conditions
+        ? '<div class="coupon-meta">' + escapeHtml(coupon.conditions) + '</div>'
+        : '';
+      return '<div class="coupon-result">' +
+        '<div><strong>Cupom: <code>' + escapeHtml(coupon.code) + '</code></strong>' +
+        discount +
+        '<button type="button" class="btn btn-outline btn-sm coupon-copy" data-coupon-code="' + escapeHtml(coupon.code) + '">Copiar</button></div>' +
+        '<div>' + escapeHtml(coupon.title) + '</div>' + expiry + conditions +
+        '<div class="coupon-meta">' + escapeHtml(coupon.status) + ' · Fonte: <a href="' + escapeHtml(sourceLink) + '" target="_blank" rel="noopener noreferrer">CupomDescontos.com</a></div>' +
+        '<a href="' + escapeHtml(couponLink) + '" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">Abrir loja e aplicar</a>' +
+        '</div>';
+    }).join('');
 
     return (
       '<div class="list-item">' +
@@ -669,16 +737,29 @@
             '<div class="offer-meta">' +
               '<span class="tag">' + escapeHtml(o.store) + '</span>' +
               deliveryBadge +
-              priceHtml +
+              '<span class="tag">' + escapeHtml(o.currency || 'BRL') + '</span>' +
             '</div>' +
+            priceHtml +
           '</div>' +
         '</div>' +
+        couponsHtml +
         '<a href="' + escapeHtml(linkUrl) + '" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">' +
           (hasPrice ? 'Abrir Oferta ↗' : 'Pesquisar na Loja ↗') +
         '</a>' +
       '</div>'
     );
   }
+
+  document.addEventListener('click', function (event) {
+    var button = event.target.closest('.coupon-copy');
+    if (!button) return;
+    var code = button.getAttribute('data-coupon-code') || '';
+    if (!code || !navigator.clipboard) return;
+    navigator.clipboard.writeText(code).then(function () {
+      button.textContent = 'Copiado';
+      setTimeout(function () { button.textContent = 'Copiar'; }, 1500);
+    }).catch(function () {});
+  });
 
   function renderOfferListHTML(offers, errors, meta) {
     var parts = [];
@@ -963,6 +1044,9 @@
               detected_category: first.detected_category,
               usd_to_brl_rate: first.usd_to_brl_rate
             });
+            if (first.offers) {
+              updateItemLastOffer(newItem.id, first.offers);
+            }
             if (first.alerts && first.alerts.length) {
               var allAlerts = getAlerts().concat(first.alerts);
               saveAlerts(allAlerts);
@@ -972,6 +1056,7 @@
           }
         } else {
           var searchRes = await executeRealSearch(name, sources, currency_filter, category);
+          updateItemLastOffer(newItem.id, searchRes.offers);
           previewOut.innerHTML = renderOfferListHTML(searchRes.offers, searchRes.errors, {
             detected_category: searchRes.detected_category,
             usd_to_brl_rate: searchRes.usd_to_brl_rate
@@ -981,6 +1066,40 @@
         btnSaveItem.disabled = false;
       }
     });
+  }
+
+  function pickBestPricedOffer(offers) {
+    if (!Array.isArray(offers)) return null;
+    for (var i = 0; i < offers.length; i++) {
+      if (Number(offers[i].price) > 0) {
+        var o = offers[i];
+        var p = normalizePricing(o);
+        return {
+          store: o.store,
+          currency: o.currency || 'BRL',
+          original_price: p.original_price,
+          price: p.price,
+          discount: p.discount,
+          price_brl_estimated: o.price_brl_estimated,
+          original_price_brl_estimated: o.original_price_brl_estimated,
+          url: o.url
+        };
+      }
+    }
+    return null;
+  }
+
+  function updateItemLastOffer(itemId, offers) {
+    var best = pickBestPricedOffer(offers);
+    var nowIso = new Date().toISOString();
+    var list = getItems().map(function (it) {
+      if (it.id !== itemId) return it;
+      var updated = Object.assign({}, it, { last_checked: nowIso });
+      if (best) updated.last_offer = best;
+      return updated;
+    });
+    saveItems(list);
+    renderMonitors();
   }
 
   // --- Renderização dos Monitoramentos ---
@@ -998,6 +1117,12 @@
       var currFilter = item.currency_filter || 'ALL';
       var sym = currFilter === 'USD' ? 'US$ ' : 'R$ ';
       var lastCheckedTxt = item.last_checked ? new Date(item.last_checked).toLocaleString('pt-BR') : 'Ainda não verificado';
+      var lastOfferHtml = item.last_offer && Number(item.last_offer.price) > 0
+        ? '<div style="margin-top:4px;">' +
+            '<span class="tag" style="margin-right:6px;">Última oferta (' + escapeHtml(item.last_offer.store) + ')</span>' +
+            renderPriceBreakdown(item.last_offer) +
+          '</div>'
+        : '';
       return (
         '<div class="list-item" data-id="' + escapeHtml(item.id) + '">' +
           '<div>' +
@@ -1016,6 +1141,7 @@
               'E-mail: <strong>' + escapeHtml((item.destinations && item.destinations['E-mail']) || 'Não informado') + '</strong> • ' +
               'Frequência: ' + escapeHtml(item.frequency || 'A cada hora') + ' • Última checagem: ' + escapeHtml(lastCheckedTxt) +
             '</div>' +
+            lastOfferHtml +
           '</div>' +
           '<div class="action-row">' +
             '<button type="button" class="btn btn-primary btn-sm js-check-one" data-id="' + escapeHtml(item.id) + '">Buscar ofertas</button>' +
@@ -1039,6 +1165,7 @@
         previewOut.innerHTML = '<p style="color:var(--muted);">Consultando ofertas para "' + escapeHtml(item.name) + '"...</p>';
         try {
           var res = await executeRealSearch(item.name, item.sources, item.currency_filter || 'ALL', item.category || 'Auto');
+          updateItemLastOffer(item.id, res.offers);
           previewOut.innerHTML = renderOfferListHTML(res.offers, res.errors, {
             detected_category: res.detected_category,
             usd_to_brl_rate: res.usd_to_brl_rate
@@ -1089,17 +1216,23 @@
     var newAlerts = [];
     var nowIso = new Date().toISOString();
 
+    var bestByItemId = {};
     scanOut.results.forEach(function (r) {
       (r.offers || []).forEach(function (o) { allFoundOffers.push(o); });
       (r.errors || []).forEach(function (e) { allErrors.push(r.item + ': ' + e); });
       (r.alerts || []).forEach(function (a) { newAlerts.push(a); });
+      var best = pickBestPricedOffer(r.offers || []);
+      if (best) bestByItemId[r.item_id] = best;
     });
 
-    // Atualiza last_checked nos itens escaneados
+    // Atualiza last_checked e última oferta (valor original, encontrado e desconto) nos itens escaneados
     var scannedIds = {};
     targetItems.forEach(function (it) { scannedIds[it.id] = true; });
     var updatedItems = getItems().map(function (it) {
-      return scannedIds[it.id] ? Object.assign({}, it, { last_checked: nowIso }) : it;
+      if (!scannedIds[it.id]) return it;
+      var patch = { last_checked: nowIso };
+      if (bestByItemId[it.id]) patch.last_offer = bestByItemId[it.id];
+      return Object.assign({}, it, patch);
     });
     saveItems(updatedItems);
     renderMonitors();
@@ -1257,16 +1390,17 @@
     }
 
     container.innerHTML = alerts.map(function (a) {
-      var sym = formatCurrencySymbol(a.currency);
       var deliveryBadge = formatDeliveryBadge(a.delivery_type || detectDeliveryType(a.name, a.store));
       var linkUrl = safeUrl(a.url);
       return (
         '<div class="list-item">' +
           '<div>' +
-            '<strong>' + escapeHtml(a.name) + '</strong> ' +
-            deliveryBadge +
-            '<span class="tag green">' + escapeHtml(sym) + ' ' + Number(a.price).toFixed(2) + ' (-' + Math.round(Number(a.discount || 0)) + '%)</span>' +
-            '<div style="font-size:0.82rem; color:var(--muted); margin-top:4px;">' +
+            '<div>' +
+              '<strong>' + escapeHtml(a.name) + '</strong> ' +
+              deliveryBadge +
+            '</div>' +
+            renderPriceBreakdown(a) +
+            '<div style="font-size:0.82rem; color:var(--muted); margin-top:6px;">' +
               'Loja: ' + escapeHtml(a.store) + ' • Moeda: ' + escapeHtml(a.currency) +
               ' • Via: ' + escapeHtml(a.notified || 'Painel') +
               ' • ' + escapeHtml(new Date(a.created_at).toLocaleString('pt-BR')) +
@@ -1292,17 +1426,18 @@
       var alerts = getAlerts();
       if (!alerts.length) return alert('Não há alertas para exportar.');
 
-      var header = ['data', 'item', 'tipo_entrega', 'loja', 'moeda', 'preco_original', 'preco', 'desconto_pct', 'notificado_via', 'url'];
+      var header = ['data', 'item', 'tipo_entrega', 'loja', 'moeda', 'valor_original', 'valor_encontrado', 'desconto_pct', 'notificado_via', 'url'];
       var rows = alerts.map(function (a) {
+        var p = normalizePricing(a);
         return [
           sanitizeCsvCell(a.created_at),
           sanitizeCsvCell(a.name),
           sanitizeCsvCell(a.delivery_type || detectDeliveryType(a.name, a.store)),
           sanitizeCsvCell(a.store),
           sanitizeCsvCell(a.currency),
-          Number(a.original_price || 0).toFixed(2),
-          Number(a.price || 0).toFixed(2),
-          Math.round(Number(a.discount || 0)),
+          p.original_price.toFixed(2),
+          p.price.toFixed(2),
+          p.discount + '%',
           sanitizeCsvCell(a.notified || 'Painel'),
           sanitizeCsvCell(safeUrl(a.url))
         ].join(';');
