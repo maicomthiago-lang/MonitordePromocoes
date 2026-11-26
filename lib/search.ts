@@ -92,6 +92,46 @@ export function filterActiveStoreCoupons(
   });
 }
 
+export function filterCouponsForProduct(
+  coupons: Coupon[],
+  productTerm: string,
+  productCategory: Exclude<ProductCategory, 'Auto'> = detectQueryCategory(productTerm)
+): Coupon[] {
+  const normalizedTerm = normalizeForSearch(productTerm);
+  if (!normalizedTerm) return [];
+  const broadCategoryPatterns: Record<string, RegExp> = {
+    jogos: /\b(jogos?|games?|videogames?)\b/,
+    software: /\b(software|licencas?|programas?)\b/,
+    hardware: /\b(hardware|componentes? de computador|pecas? de computador)\b/,
+    eletronicos: /\b(eletronicos?|eletrodomesticos?)\b/
+  };
+  const broadOfferPattern = /\b(todos os produtos|qualquer produto|site todo|todo o site|loja toda|toda a loja|toda linha|todas as categorias|primeira compra|primeiro pedido|em qualquer compra)\b/;
+  const exclusions = /\b(?:exceto|nao valido para|nao se aplica a|exclui)\s+([a-z0-9 ]{1,80})/g;
+
+  return coupons.filter((coupon) => {
+    const text = `${coupon.title} ${coupon.conditions || ''}`;
+    const normalizedText = normalizeForSearch(text);
+    exclusions.lastIndex = 0;
+    let exclusion: RegExpExecArray | null;
+    while ((exclusion = exclusions.exec(normalizedText)) !== null) {
+      const excludedText = exclusion[1] || '';
+      const categoryPattern = broadCategoryPatterns[normalizeForSearch(productCategory)];
+      const excludedAlternatives = excludedText.split(/\s+(?:e|ou)\s+/);
+      if (
+        excludedAlternatives.some((scope) => matchesSearchTerm(productTerm, scope)) ||
+        categoryPattern?.test(excludedText)
+      ) return false;
+    }
+
+    if (matchesSearchTerm(text, productTerm) || broadOfferPattern.test(normalizedText)) return true;
+    const categoryPattern = broadCategoryPatterns[normalizeForSearch(productCategory)];
+    return Boolean(categoryPattern?.test(normalizedText));
+  }).map((coupon) => ({
+    ...coupon,
+    status: 'Vigente na fonte; regras compatíveis pelo texto; checkout não testado'
+  }));
+}
+
 async function findStoreCoupons(storeName: string): Promise<Coupon[]> {
   const key = normalizeForSearch(storeName);
   const cached = couponCache.get(key);
@@ -113,13 +153,18 @@ async function findStoreCoupons(storeName: string): Promise<Coupon[]> {
   }
 }
 
-async function attachCouponsToOffers(offers: Offer[]): Promise<void> {
+async function attachCouponsToOffers(
+  offers: Offer[],
+  productTerm: string,
+  productCategory: Exclude<ProductCategory, 'Auto'>
+): Promise<void> {
   const storeNames = Array.from(new Set(offers.filter((offer) => offer.price > 0).map((offer) => offer.store))).slice(0, 6);
   const couponsByStore = new Map<string, Coupon[]>();
   await Promise.all(storeNames.map(async (store) => couponsByStore.set(store, await findStoreCoupons(store))));
   for (const offer of offers) {
     const coupons = couponsByStore.get(offer.store);
-    if (coupons?.length) offer.coupons = coupons;
+    const matchingCoupons = coupons ? filterCouponsForProduct(coupons, productTerm, productCategory) : [];
+    if (matchingCoupons.length) offer.coupons = matchingCoupons;
   }
 }
 
@@ -925,7 +970,7 @@ export async function searchSources(
   }
 
   // Ordenar: ofertas com preço real primeiro (priorizando relevância alta e menor preço equivalente)
-  await attachCouponsToOffers(offers);
+  await attachCouponsToOffers(offers, term, detectedCategory);
 
   offers.sort((a, b) => {
     if (a.price > 0 && b.price === 0) return -1;
