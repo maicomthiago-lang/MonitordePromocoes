@@ -4,6 +4,20 @@ export type CurrencyCode = 'BRL' | 'USD';
 export type CurrencyFilter = 'ALL' | CurrencyCode;
 export type ProductCategory = 'Auto' | 'Jogos' | 'Software' | 'Hardware' | 'Eletrônicos' | 'Outros';
 
+export interface Coupon {
+  code: string;
+  title: string;
+  store_name: string;
+  discount_percent?: number | null;
+  discount_fixed?: number | null;
+  expires_at_brt?: string | null;
+  conditions?: string | null;
+  url: string;
+  source_url: string;
+  source: string;
+  status: string;
+}
+
 export interface Offer {
   name: string;
   store: string;
@@ -11,6 +25,7 @@ export interface Offer {
   delivery_type: DeliveryType;
   currency: CurrencyCode;
   original_price: number;
+  original_price_brl_estimated?: number;
   price: number;
   price_brl_estimated?: number;
   discount: number;
@@ -18,11 +33,23 @@ export interface Offer {
   thumb?: string;
   relevance?: number;
   checked_at?: string;
+  coupons?: Coupon[];
 }
 
 export interface RssFeedConfig {
   name?: string;
   url: string;
+}
+
+export interface LastOfferSummary {
+  store: string;
+  currency: CurrencyCode;
+  original_price: number;
+  price: number;
+  discount: number;
+  price_brl_estimated?: number;
+  original_price_brl_estimated?: number;
+  url?: string;
 }
 
 export interface MonitorItem {
@@ -39,6 +66,7 @@ export interface MonitorItem {
   active: boolean;
   created_at: string;
   last_checked?: string;
+  last_offer?: LastOfferSummary;
 }
 
 export interface AlertRecord extends Offer {

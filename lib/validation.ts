@@ -32,7 +32,19 @@ export const monitorItemSchema = z.object({
   frequency: z.string().trim().min(1).max(40).default('A cada hora'),
   active: z.boolean().default(true),
   created_at: z.string().trim().max(64).default(() => new Date().toISOString()),
-  last_checked: z.string().trim().max(64).optional()
+  last_checked: z.string().trim().max(64).optional(),
+  last_offer: z
+    .object({
+      store: z.string().trim().max(80),
+      currency: z.enum(['BRL', 'USD']),
+      original_price: z.number().nonnegative(),
+      price: z.number().nonnegative(),
+      discount: z.number().min(0).max(100),
+      price_brl_estimated: z.number().nonnegative().optional(),
+      original_price_brl_estimated: z.number().nonnegative().optional(),
+      url: z.string().trim().max(2000).optional()
+    })
+    .optional()
 });
 
 export const runtimeConfigSchema = z

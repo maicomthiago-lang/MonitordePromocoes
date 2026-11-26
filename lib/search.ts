@@ -1,8 +1,8 @@
 import { XMLParser } from 'fast-xml-parser';
 import { detectDeliveryType } from './classifier.js';
-import { detectQueryCategory, matchesSearchTerm, scoreOfferRelevance } from './relevance.js';
+import { detectQueryCategory, matchesSearchTerm, normalizeForSearch, scoreOfferRelevance } from './relevance.js';
 import { cleanHttpUrl, parsePriceString, validateExternalFetchUrl } from './security.js';
-import type { CurrencyFilter, MonitorItem, Offer, ProductCategory, RssFeedConfig } from './types.js';
+import type { Coupon, CurrencyFilter, MonitorItem, Offer, ProductCategory, RssFeedConfig } from './types.js';
 
 export const CS_STORES: Record<string, string> = {
   '1': 'Steam',
@@ -47,6 +47,81 @@ const xmlParser = new XMLParser({
 });
 
 let cachedUsdRate: { rate: number; expiresAt: number } | null = null;
+const couponCache = new Map<string, { coupons: Coupon[]; expiresAt: number }>();
+
+export type CouponApiRecord = {
+  code?: string | null;
+  title?: string;
+  store_name?: string | null;
+  discount_percent?: number | null;
+  discount_fixed?: number | null;
+  expires_at?: string | null;
+  expires_at_brt?: string | null;
+  conditions?: string | null;
+  source?: string;
+  url?: string;
+  source_url?: string;
+};
+
+export function filterActiveStoreCoupons(
+  records: CouponApiRecord[],
+  storeName: string,
+  now = Date.now()
+): Coupon[] {
+  const key = normalizeForSearch(storeName);
+  return records.flatMap((item): Coupon[] => {
+    if (!item.code || !item.store_name || !item.url || !item.source_url) return [];
+    if (normalizeForSearch(item.store_name) !== key) return [];
+    if (item.expires_at && Date.parse(item.expires_at) <= now) return [];
+    const couponUrl = cleanHttpUrl(item.url);
+    const sourceUrl = cleanHttpUrl(item.source_url);
+    if (!couponUrl || !sourceUrl) return [];
+    return [{
+      code: item.code.slice(0, 80),
+      title: String(item.title || 'Cupom da loja').slice(0, 180),
+      store_name: item.store_name.slice(0, 80),
+      discount_percent: item.discount_percent,
+      discount_fixed: item.discount_fixed,
+      expires_at_brt: item.expires_at_brt,
+      conditions: item.conditions ? item.conditions.slice(0, 280) : null,
+      url: couponUrl,
+      source_url: sourceUrl,
+      source: item.source || 'fonte externa',
+      status: 'Vigente na fonte; checkout não testado'
+    }];
+  });
+}
+
+async function findStoreCoupons(storeName: string): Promise<Coupon[]> {
+  const key = normalizeForSearch(storeName);
+  const cached = couponCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.coupons;
+
+  const endpoint = new URL('https://cupomdescontos.com/api/coupons');
+  endpoint.searchParams.set('q', storeName.slice(0, 60));
+  endpoint.searchParams.set('limit', '20');
+
+  try {
+    const response = await fetchJson<{ data?: CouponApiRecord[] }>(endpoint.toString(), 6_000);
+    const now = Date.now();
+    const coupons = filterActiveStoreCoupons(response.data ?? [], storeName, now);
+    couponCache.set(key, { coupons, expiresAt: now + 10 * 60_000 });
+    return coupons;
+  } catch {
+    couponCache.set(key, { coupons: [], expiresAt: Date.now() + 60_000 });
+    return [];
+  }
+}
+
+async function attachCouponsToOffers(offers: Offer[]): Promise<void> {
+  const storeNames = Array.from(new Set(offers.filter((offer) => offer.price > 0).map((offer) => offer.store))).slice(0, 6);
+  const couponsByStore = new Map<string, Coupon[]>();
+  await Promise.all(storeNames.map(async (store) => couponsByStore.set(store, await findStoreCoupons(store))));
+  for (const offer of offers) {
+    const coupons = couponsByStore.get(offer.store);
+    if (coupons?.length) offer.coupons = coupons;
+  }
+}
 
 async function fetchJson<T>(url: string, timeoutMs = 10_000, extraHeaders: Record<string, string> = {}): Promise<T> {
   const controller = new AbortController();
@@ -480,13 +555,41 @@ export function parseRssXmlOffers(xml: string, term: string, storeName: string):
     const link = cleanHttpUrl(extractXmlLink(entry.link));
     if (!link) continue;
 
-    const priceMatch = `${title} ${desc}`.match(/(R\$|BRL|US\$|USD|\$)\s*([\d.,]+)/i);
-    if (!priceMatch) continue;
+    const combinedText = `${title} ${desc}`;
+    const dePorMatch = combinedText.match(
+      /de\s+(R\$|BRL|US\$|USD|\$)\s*([\d.,]+)\s+(?:por|para)\s+(R\$|BRL|US\$|USD|\$)?\s*([\d.,]+)/i
+    );
 
-    const currencyToken = priceMatch[1] || '';
-    const isUsd = /^(US\$|USD|\$)$/i.test(currencyToken.trim());
-    const parsedPrice = parsePriceString(priceMatch[2] || '', isUsd);
+    let isUsd = false;
+    let parsedPrice = Number.NaN;
+    let originalPrice = Number.NaN;
+
+    if (dePorMatch) {
+      const currToken = dePorMatch[3] || dePorMatch[1] || '';
+      isUsd = /^(US\$|USD|\$)$/i.test(currToken.trim());
+      originalPrice = parsePriceString(dePorMatch[2] || '', isUsd);
+      parsedPrice = parsePriceString(dePorMatch[4] || '', isUsd);
+    } else {
+      const priceMatch = combinedText.match(/(R\$|BRL|US\$|USD|\$)\s*([\d.,]+)/i);
+      if (!priceMatch) continue;
+      const currencyToken = priceMatch[1] || '';
+      isUsd = /^(US\$|USD|\$)$/i.test(currencyToken.trim());
+      parsedPrice = parsePriceString(priceMatch[2] || '', isUsd);
+      originalPrice = parsedPrice;
+    }
+
     if (!Number.isFinite(parsedPrice) || parsedPrice <= 0) continue;
+
+    const pctMatch = combinedText.match(/(?:-|\b)(\d{1,2})\s*%\s*(?:off|desconto)?/i);
+    let discount = pctMatch ? Number(pctMatch[1]) : 0;
+
+    if (Number.isFinite(originalPrice) && originalPrice > parsedPrice) {
+      discount = Math.round(((originalPrice - parsedPrice) / originalPrice) * 100);
+    } else if (discount > 0 && discount < 100) {
+      originalPrice = Number((parsedPrice / (1 - discount / 100)).toFixed(2));
+    } else {
+      originalPrice = parsedPrice;
+    }
 
     out.push({
       name: title.slice(0, 180),
@@ -494,9 +597,9 @@ export function parseRssXmlOffers(xml: string, term: string, storeName: string):
       kind: 'RSS',
       delivery_type: detectDeliveryType(title, storeName, desc),
       currency: isUsd ? 'USD' : 'BRL',
-      price: parsedPrice,
-      original_price: parsedPrice,
-      discount: 0,
+      price: Number(parsedPrice.toFixed(2)),
+      original_price: Number(originalPrice.toFixed(2)),
+      discount: Math.max(0, Math.min(100, Math.round(discount))),
       url: link,
       relevance: scoreOfferRelevance(title, term),
       checked_at: new Date().toISOString()
@@ -541,6 +644,49 @@ export async function rssSearch(
   }
 
   return { offers: out, errors };
+}
+
+export function normalizeOfferPricing(offer: Offer, usdToBrlRate: number | null = null): Offer {
+  const price = Number.isFinite(Number(offer.price)) && Number(offer.price) > 0 ? Number(Number(offer.price).toFixed(2)) : 0;
+  if (price <= 0) {
+    return { ...offer, price: 0, original_price: 0, discount: 0 };
+  }
+
+  let originalPrice =
+    Number.isFinite(Number(offer.original_price)) && Number(offer.original_price) > 0
+      ? Number(Number(offer.original_price).toFixed(2))
+      : price;
+
+  let discount =
+    Number.isFinite(Number(offer.discount)) && Number(offer.discount) > 0
+      ? Math.min(100, Math.round(Number(offer.discount)))
+      : 0;
+
+  if (originalPrice < price) {
+    originalPrice = price;
+  }
+
+  if (originalPrice > price) {
+    discount = Math.max(0, Math.min(100, Math.round(((originalPrice - price) / originalPrice) * 100)));
+  } else if (discount > 0 && discount < 100) {
+    originalPrice = Number((price / (1 - discount / 100)).toFixed(2));
+  } else {
+    discount = 0;
+  }
+
+  const normalized: Offer = {
+    ...offer,
+    price,
+    original_price: originalPrice,
+    discount
+  };
+
+  if (offer.currency === 'USD' && usdToBrlRate && usdToBrlRate > 0) {
+    normalized.price_brl_estimated = Math.round(Math.round(price * 100) * usdToBrlRate) / 100;
+    normalized.original_price_brl_estimated = Math.round(Math.round(originalPrice * 100) * usdToBrlRate) / 100;
+  }
+
+  return normalized;
 }
 
 export function qualifies(item: MonitorItem, offer: Offer, usdToBrlRate: number | null = null): boolean {
@@ -762,24 +908,16 @@ export async function searchSources(
   // Deduplicar ofertas idênticas por loja + url + moeda
   const seen = new Set<string>();
   offers = offers.filter((o) => {
+    if (!Number.isFinite(o.price) || o.price <= 0 || !matchesSearchTerm(o.name, term)) return false;
+    if (!cleanHttpUrl(o.url)) return false;
     const key = `${o.store}|${o.currency}|${o.url}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
 
-  // Enriquecer ofertas em USD com estimativa em BRL quando a cotação estiver disponível
-  if (usdToBrlRate && usdToBrlRate > 0) {
-    offers = offers.map((o) => {
-      if (o.currency === 'USD' && o.price > 0) {
-        return {
-          ...o,
-          price_brl_estimated: Number((o.price * usdToBrlRate).toFixed(2))
-        };
-      }
-      return o;
-    });
-  }
+  // Normalizar sempre valor original, valor encontrado e porcentagem aplicada (+ estimativa BRL se USD)
+  offers = offers.map((o) => normalizeOfferPricing(o, usdToBrlRate));
 
   // Filtrar por moeda selecionada
   if (currencyFilter === 'BRL' || currencyFilter === 'USD') {
@@ -787,6 +925,8 @@ export async function searchSources(
   }
 
   // Ordenar: ofertas com preço real primeiro (priorizando relevância alta e menor preço equivalente)
+  await attachCouponsToOffers(offers);
+
   offers.sort((a, b) => {
     if (a.price > 0 && b.price === 0) return -1;
     if (a.price === 0 && b.price > 0) return 1;
