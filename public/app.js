@@ -319,6 +319,7 @@
       chk.addEventListener('change', function () {
         chip.classList.toggle('selected', chk.checked);
         updateBulkSourceButton(bulkButtonId, inputClass);
+        if (inputClass === 'search-src-chk') updateSearchButtonLabel();
       });
     });
     updateBulkSourceButton(bulkButtonId, inputClass);
@@ -343,6 +344,7 @@
       input.closest('.source-chip').classList.toggle('selected', shouldCheck);
     });
     updateBulkSourceButton(buttonId, inputClass);
+    if (inputClass === 'search-src-chk') updateSearchButtonLabel();
   }
 
   document.getElementById('btn-toggle-all-monitor-sources').addEventListener('click', function () {
@@ -376,7 +378,11 @@
     var errors = [];
     var currMode = currencyFilter || 'ALL';
     var detected = category && category !== 'Auto' ? category : detectQueryCategory(term);
-    var effectiveSources = sources.slice();
+    var selectedSources = Array.isArray(sources) ? sources : [];
+    var availableSources = SOURCES_BY_CATEGORY.Auto;
+    var effectiveSources = selectedSources.length
+      ? selectedSources.slice()
+      : availableSources.map(function (source) { return source.name; });
 
     if (category === 'Auto' && detected !== 'Jogos') {
       effectiveSources = effectiveSources.filter(function (s) {
@@ -1356,6 +1362,13 @@
   var selectSearchCategory = document.getElementById('search-category');
   var selectSearchCurrency = document.getElementById('search-currency');
 
+  function updateSearchButtonLabel() {
+    if (!btnRunSearch || btnRunSearch.disabled) return;
+    btnRunSearch.textContent = document.querySelector('.search-src-chk:checked')
+      ? 'Buscar nas fontes marcadas'
+      : 'Buscar na internet';
+  }
+
   function updateSearchCategorySources() {
     var cat = selectSearchCategory ? selectSearchCategory.value : 'Auto';
     renderSourceChips('search-chips-container', cat, 'search-src-chk', true, 'btn-toggle-all-search-sources');
@@ -1368,13 +1381,13 @@
     var sources = Array.from(document.querySelectorAll('.search-src-chk:checked')).map(function (el) { return el.value; });
     var out = document.getElementById('search-output');
 
-    if (!term || !sources.length) {
-      out.innerHTML = '<p style="color:#fca5a5;">Digite o produto e selecione ao menos uma fonte. Use “Marcar todas” para consultar todas as lojas.</p>';
+    if (!term) {
+      out.innerHTML = '<p style="color:#fca5a5;">Digite o produto que deseja pesquisar.</p>';
       return;
     }
 
     btnRunSearch.disabled = true;
-    btnRunSearch.textContent = 'Buscando ofertas...';
+    btnRunSearch.textContent = sources.length ? 'Buscando nas fontes marcadas...' : 'Pesquisando na internet...';
     out.innerHTML = '<p style="color:var(--muted);">Consultando fontes compatíveis para "' + escapeHtml(term) + '"...</p>';
 
     try {
@@ -1385,7 +1398,7 @@
       });
     } finally {
       btnRunSearch.disabled = false;
-      btnRunSearch.textContent = 'Buscar nas lojas';
+      updateSearchButtonLabel();
     }
   }
 

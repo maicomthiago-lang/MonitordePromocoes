@@ -13,7 +13,7 @@ export const rssFeedSchema = z.object({
 
 export const searchRequestSchema = z.object({
   term: z.string().trim().min(1, 'Informe o termo de busca.').max(120, 'Termo muito longo.'),
-  sources: z.array(z.string().trim().min(1).max(60)).min(1, 'Selecione ao menos uma fonte.').max(20),
+  sources: z.array(z.string().trim().min(1).max(60)).max(20).default([]),
   rss_feeds: z.array(rssFeedSchema).max(5).optional().default([]),
   currency: currencyFilterSchema.optional().default('ALL'),
   category: categorySchema.optional().default('Auto')

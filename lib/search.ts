@@ -775,7 +775,10 @@ export async function searchSources(
 
   // Em pesquisa livre (Auto), se o termo for Software/Hardware/Eletrônicos (ex.: "windows 11"),
   // evita poluir a busca com links de lojas exclusivas de jogos e inclui fontes de varejo/software.
-  let effectiveSources = Array.from(new Set(sources));
+  const requestedSources = sources.length > 0
+    ? sources
+    : [...GAME_ONLY_SOURCES, ...NON_GAME_DEFAULT_SOURCES];
+  let effectiveSources = Array.from(new Set(requestedSources));
   if (isNonGameAuto) {
     const nonGameSelected = effectiveSources.filter((s) => !GAME_ONLY_SOURCES.has(s));
     effectiveSources = Array.from(new Set([...nonGameSelected, ...NON_GAME_DEFAULT_SOURCES]));
